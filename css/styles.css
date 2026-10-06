@@ -154,3 +154,24 @@ details > summary { cursor: pointer; font-weight: 650; }
 .opt { display: flex; gap: .7rem; align-items: flex-start; padding: .8rem; border: 1.5px solid var(--line); border-radius: 14px; margin-bottom: .6rem; cursor: pointer; font-weight: 400; color: var(--text); font-size: .95rem; }
 .opt:has(input:checked) { border-color: var(--brand); background: var(--brand-l); }
 @media print { .topbar, .btn, .savebar, .toast, .ai-card .row { display: none !important; } body { background: #fff; color: #000; } .card { box-shadow: none; } }
+
+/* accounts */
+.topbar { flex-wrap: wrap; }
+.userbox { display: flex; align-items: center; gap: .4rem; margin-left: auto; }
+.userbox:empty { display: none; }
+.topbar nav { margin-left: .5rem; margin-right: auto; }
+.userchip { display: inline-flex; align-items: center; gap: .45rem; font-weight: 650; font-size: .9rem; }
+.uav { display: inline-grid; place-items: center; width: 1.7rem; height: 1.7rem; border-radius: 50%; background: rgba(255,255,255,.9); color: var(--brand-d); font-weight: 800; font-size: .85rem; }
+.picker .uav, .auth .uav { background: var(--brand-l); }
+@media (max-width: 560px) { .uname { display: none; } }
+.auth { min-height: 70vh; display: grid; place-items: center; }
+.auth-card { width: 100%; max-width: 420px; padding: 1.6rem 1.5rem; }
+.auth-logo { width: 3.2rem; height: 3.2rem; border-radius: 16px; background: var(--grad); color: #fff; display: grid; place-items: center; font-size: 1.6rem; margin: 0 auto 1rem; box-shadow: 0 8px 20px rgba(13,148,136,.35); }
+.auth h1 { text-align: center; font-size: 1.45rem; } .auth p.muted { text-align: center; }
+.picker { display: flex; flex-wrap: wrap; gap: .5rem; justify-content: center; margin: .6rem 0 1rem; }
+.pick { appearance: none; border: 1.5px solid var(--line); background: var(--soft); color: var(--text); border-radius: 99px; padding: .3rem .8rem .3rem .3rem; display: inline-flex; align-items: center; gap: .5rem; font: inherit; font-weight: 600; font-size: .9rem; cursor: pointer; }
+.pick:hover { border-color: var(--brand); }
+.reckey { font: 700 1.15rem/1.6 ui-monospace, "SF Mono", Consolas, monospace; letter-spacing: .06em; text-align: center; background: var(--soft); border: 2px dashed var(--brand); border-radius: 14px; padding: 1rem .5rem; word-break: break-all; user-select: all; }
+dialog.modal { border: 0; border-radius: var(--radius); padding: 1.3rem; width: min(440px, 92vw); background: var(--card); color: var(--text); box-shadow: 0 24px 60px rgba(0,0,0,.35); }
+dialog.modal::backdrop { background: rgba(8,20,24,.55); backdrop-filter: blur(3px); }
+@media print { .reckey { border-color: #000; } .auth .row, .auth label, .auth .btn, .auth .disclaimer { display: none !important; } }

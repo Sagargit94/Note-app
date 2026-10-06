@@ -1,8 +1,10 @@
 import * as db from './db.js';
+import * as auth from './auth.js';
+import { encryptWithPassphrase, decryptWithPassphrase } from './crypto.js';
 import { esc, uid, fmtDate, fmtDateTime, fmtDur, age, debounce, toLocalInput, fromLocalInput, mdToHtml, download, blobToBase64, base64ToBlob } from './util.js';
 import { analyze, sortVisits, series, STATUS_LABEL } from './analysis.js';
 import { lineChart } from './charts.js';
-import { getSettings, saveSettings, runReview, runSoap, transcribeAudio, testConnection, providerLabel, isCloud } from './ai.js';
+import { attachSettings, detachSettings, getSettings, saveSettings, runReview, runSoap, transcribeAudio, testConnection, providerLabel, isCloud } from './ai.js';
 import { Recorder, speechSupported, recordingSupported } from './voice.js';
 
 const app = document.getElementById('app');
@@ -19,6 +21,7 @@ function toast(msg, isError = false) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => (t.hidden = true), isError ? 6000 : 2800);
 }
+let recordingActive = false;
 const cleanups = [];
 const onLeave = (fn) => cleanups.push(fn);
 async function runCleanups() {
@@ -46,6 +49,7 @@ function notFound() {
 // ---------- router ----------
 async function route() {
   await runCleanups();
+  if (!session) return authView();
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
   $$('[data-nav]', document).forEach((a) => a.classList.toggle('active', a.dataset.nav === (parts[0] === 'settings' ? 'settings' : 'patients')));
   try {
@@ -84,12 +88,14 @@ async function patientsView() {
   const weekVisits = visits.filter((v) => new Date(v.date).getTime() >= weekAgo).length;
   const attention = rows.filter(({ p, a }) => (p.status || 'active') === 'active' && (a.alerts.length || a.flags.length)).length;
   const st = getSettings();
+  const legacy = await db.legacyExists();
   app.innerHTML = `
     <section class="hero">
       <div class="row between"><div><h1>${hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening'} 👋</h1><p>Here’s your caseload at a glance.</p></div>
         <a class="btn white" href="#/patient/new">+ New patient</a></div>
       <div class="stats"><div class="stat"><b>${activeCount}</b><span>Active patients</span></div><div class="stat"><b>${weekVisits}</b><span>Visits this week</span></div><div class="stat"><b>${attention}</b><span>Need attention</span></div></div>
     </section>
+    ${legacy ? `<div class="setup row between"><div><strong>📦 Notes from before accounts were added</strong><div class="small">Found patient data saved unencrypted in this browser. Move it into your encrypted account (it will then be deleted from the old location).</div></div><button class="btn sm primary" id="claim">Import into my account</button></div>` : ''}
     ${st.provider === 'gemini' && !st.geminiKey ? `<div class="setup row between"><div><strong>✨ Turn on your free AI assistant</strong><div class="small">Connect Google Gemini in about a minute to get treatment recommendations and dictation-to-notes.</div></div><a class="btn sm primary" href="#/settings">Set up</a></div>` : ''}
     <div class="row" style="margin-bottom:1rem">
       <input id="q" class="grow" type="search" placeholder="🔍  Search name, condition, phone…" aria-label="Search patients">
@@ -123,6 +129,21 @@ async function patientsView() {
       : `<li class="card empty"><svg viewBox="0 0 160 120" aria-hidden="true"><rect x="30" y="20" width="100" height="84" rx="14" fill="var(--brand-l)"/><circle cx="80" cy="52" r="16" fill="var(--brand)"/><path d="M52 94c4-16 52-16 56 0" fill="var(--brand)"/><path d="M122 18v18M113 27h18" stroke="var(--accent)" stroke-width="5" stroke-linecap="round"/></svg>
           <h2>Add your first patient</h2><p class="muted">Create a profile, then record voice notes during the visit.</p><a class="btn primary" href="#/patient/new">+ New patient</a></li>`;
   };
+  $('#claim')?.addEventListener('click', async () => {
+    try {
+      const d = await db.readLegacy();
+      for (const p of d.patients) await db.put('patients', p);
+      for (const v of d.visits) await db.put('visits', v);
+      for (const a of d.audio) await db.put('audio', a);
+      try { // old plaintext settings (incl. API key) -> encrypted settings
+        const old = JSON.parse(localStorage.getItem('physio-notes-settings') || 'null');
+        if (old) { saveSettings({ ...getSettings(), ...old }); localStorage.removeItem('physio-notes-settings'); }
+      } catch { /* ignore */ }
+      await db.deleteLegacy();
+      toast(`Imported ${d.patients.length} patients and ${d.visits.length} visits`);
+      route();
+    } catch (e) { toast('Import failed: ' + e.message, true); }
+  });
   $('#q').addEventListener('input', draw);
   $('#filter').addEventListener('change', draw);
   draw();
@@ -342,7 +363,7 @@ async function visitView(id, pid, requestedType) {
         <h1 style="margin:0">${existing ? 'Edit visit' : v.type === 'initial' ? 'Initial assessment' : 'Follow-up visit'}</h1></div>
       <span id="saveState" class="muted small" aria-live="polite">${existing ? 'Saved' : 'Not saved yet'}</span>
     </div>
-    <form id="vf" class="stack" onsubmit="return false">
+    <form id="vf" class="stack">
       ${prev ? `<div class="prev"><div><b>Last visit · ${fmtDate(prev.date)}</b> ${prev.pain != null && prev.pain !== '' ? ` · pain ${prev.pain}` : ''}${prev.function != null && prev.function !== '' ? ` · function ${prev.function}` : ''}</div>
         ${prev.assessment ? `<p><b>Assessment:</b> ${esc(prev.assessment)}</p>` : ''}${prev.plan ? `<p><b>Plan:</b> ${esc(prev.plan)}</p>` : ''}${prev.hep ? `<p><b>HEP:</b> ${esc(prev.hep)}</p>` : ''}
         ${patient.goals ? `<p><b>Goals:</b> ${esc(patient.goals)}</p>` : ''}</div>` : (patient.goals ? `<div class="prev"><b>Patient goals:</b> ${esc(patient.goals)}</div>` : '')}
@@ -388,6 +409,8 @@ async function visitView(id, pid, requestedType) {
         <button type="button" class="btn danger sm" id="delVisit">${existing ? 'Delete visit' : 'Discard'}</button>
       </div>
     </form>`;
+
+  $('#vf').addEventListener('submit', (e) => e.preventDefault());
 
   // --- saving ---
   const state = $('#saveState');
@@ -489,6 +512,7 @@ async function visitView(id, pid, requestedType) {
   // --- recording ---
   let recorder = null;
   const setMic = (on) => {
+    recordingActive = on;
     const b = $('#recBtn');
     b.textContent = on ? '■' : '🎙';
     b.classList.toggle('live', on);
@@ -600,14 +624,20 @@ async function settingsView() {
       <p class="muted small">Live transcription uses your browser’s speech recognition (Chrome/Edge send audio to their speech service; Safari may too). For maximum privacy, record audio only and transcribe with a local method, or type notes.</p>
     </div>
 
+    <div class="card"><h2>🔒 Account &amp; security</h2>
+      <p class="muted small" style="margin-top:0">Signed in as <strong>${esc(session.user.displayName)}</strong> (@${esc(session.user.username)}). Your patients, notes, recordings and API key are encrypted with a key only your password (or recovery key) can unlock. Colleagues using this app can’t see them.</p>
+      <div class="grid2"><div><label for="lockMin">Auto-lock after inactivity</label><select id="lockMin">${[5, 10, 15, 30].map((m) => `<option value="${m}" ${s.lockMinutes === m ? 'selected' : ''}>${m} minutes</option>`).join('')}</select></div></div>
+      <div class="row" style="margin-top:.8rem"><button class="btn" id="chPw">Change password</button><button class="btn" id="newRec">New recovery key</button><button class="btn danger" id="delAcct">Delete my account</button></div>
+    </div>
+
     <div class="card"><h2>Backup &amp; data</h2>
-      <p class="muted small" style="margin-top:0">All data is stored <strong>only on this device</strong> (in the browser). Clearing browser data or losing the device loses it — export backups regularly and store them encrypted.${est ? ` Using ${(est.usage / 1048576).toFixed(1)} MB.` : ''}</p>
+      <p class="muted small" style="margin-top:0">Data is stored <strong>only on this device</strong>, inside your encrypted account. Clearing browser data or losing the device loses it — export a backup regularly. Backups are <strong>encrypted with a passphrase you choose</strong>, so a stray file can’t leak patient data. They can also be imported on another device.${est ? ` Using ${(est.usage / 1048576).toFixed(1)} MB.` : ''}</p>
       <div class="row">
-        <button class="btn" id="expNo">Export backup (no audio)</button>
-        <button class="btn" id="expYes">Export backup with audio</button>
-        <label class="btn" for="impFile" style="margin:0;color:var(--text)">Import backup…</label><input type="file" id="impFile" accept="application/json" hidden>
+        <button class="btn" id="expNo">Export encrypted backup</button>
+        <button class="btn" id="expYes">Export with audio</button>
+        <label class="btn" for="impFile" style="margin:0;color:var(--text)">Import backup…</label><input type="file" id="impFile" accept="application/json,.json" hidden>
         <button class="btn" id="persist">Protect storage from auto-clearing</button>
-        <button class="btn danger" id="wipe">Delete all data</button>
+        <button class="btn danger" id="wipe">Delete all my patient data</button>
       </div><span id="dataMsg" class="small muted"></span>
     </div></div>`;
 
@@ -633,42 +663,253 @@ async function settingsView() {
     try { $('#aiMsg').textContent = '✓ ' + await testConnection(); } catch (e) { $('#aiMsg').textContent = '✗ ' + e.message; }
   };
 
+  $('#lockMin').onchange = () => saveSettings({ ...getSettings(), lockMinutes: +$('#lockMin').value });
+
   const exportAll = async (withAudio) => {
+    const v = await askDialog({ title: 'Encrypt this backup', text: 'Choose a passphrase. You will need it to restore the backup — it cannot be recovered.', fields: [{ name: 'p1', label: 'Passphrase' }, { name: 'p2', label: 'Repeat passphrase' }], ok: 'Export' });
+    if (!v) return;
+    if (v.p1 !== v.p2) return toast('Passphrases do not match.', true);
+    const bad = auth.validatePassword(v.p1);
+    if (bad) return toast(bad, true);
+    $('#dataMsg').innerHTML = '<span class="spinner"></span> Encrypting…';
     const [patients, visits, audioRows] = await Promise.all([db.getAll('patients'), db.getAll('visits'), db.getAll('audio')]);
-    const audio = withAudio ? await Promise.all(audioRows.map(async ({ blob, ...a }) => ({ ...a, data: await blobToBase64(blob) }))) : [];
-    const blob = new Blob([JSON.stringify({ app: 'physio-notes', version: 1, exportedAt: new Date().toISOString(), patients, visits, audio })], { type: 'application/json' });
-    download(`physio-notes-backup-${new Date().toISOString().slice(0, 10)}${withAudio ? '-audio' : ''}.json`, blob);
-    $('#dataMsg').textContent = `Exported ${patients.length} patients, ${visits.length} visits${withAudio ? `, ${audio.length} recordings` : ''}.`;
+    const audio = withAudio ? await Promise.all(audioRows.map(async ({ blob, ...a }) => ({ ...a, mime: blob.type, data: await blobToBase64(blob) }))) : [];
+    const file = await encryptWithPassphrase(v.p1, JSON.stringify({ app: 'physio-notes', version: 2, exportedAt: new Date().toISOString(), patients, visits, audio }));
+    download(`physio-notes-backup-${new Date().toISOString().slice(0, 10)}${withAudio ? '-audio' : ''}.enc.json`, new Blob([JSON.stringify(file)], { type: 'application/json' }));
+    $('#dataMsg').textContent = `Exported ${patients.length} patients, ${visits.length} visits${withAudio ? `, ${audio.length} recordings` : ''} (encrypted).`;
   };
-  $('#expNo').onclick = () => exportAll(false);
-  $('#expYes').onclick = () => exportAll(true);
+  $('#expNo').onclick = () => exportAll(false).catch((e) => toast(e.message, true));
+  $('#expYes').onclick = () => exportAll(true).catch((e) => toast(e.message, true));
   $('#impFile').onchange = async (e) => {
     const file = e.target.files[0];
+    e.target.value = '';
     if (!file) return;
     try {
-      const d = JSON.parse(await file.text());
+      let d = JSON.parse(await file.text());
+      if (d.encrypted) {
+        const v = await askDialog({ title: 'Backup passphrase', fields: [{ name: 'p', label: 'Passphrase used when exporting' }], ok: 'Decrypt' });
+        if (!v) return;
+        d = JSON.parse(await decryptWithPassphrase(v.p, d));
+      }
       if (d.app !== 'physio-notes') throw new Error('Not a PhysioNotes backup file.');
-      if (!confirm(`Import ${d.patients?.length || 0} patients and ${d.visits?.length || 0} visits? Records with the same ID will be overwritten.`)) return;
+      if (!confirm(`Import ${d.patients?.length || 0} patients and ${d.visits?.length || 0} visits into your account? Records with the same ID will be overwritten.`)) return;
       for (const p of d.patients || []) await db.put('patients', p);
       for (const x of d.visits || []) await db.put('visits', x);
       for (const { data, ...a } of d.audio || []) await db.put('audio', { ...a, blob: base64ToBlob(data, a.mime) });
       $('#dataMsg').textContent = 'Import complete.';
     } catch (err) { toast('Import failed: ' + err.message, true); }
-    e.target.value = '';
   };
   $('#persist').onclick = async () => {
     const ok = navigator.storage?.persist ? await navigator.storage.persist() : false;
     toast(ok ? 'Storage protected from automatic clearing.' : 'Browser declined (installing the app to your home screen may help).', !ok);
   };
   $('#wipe').onclick = async () => {
-    if (prompt('This permanently deletes ALL patients, notes and recordings on this device. Type DELETE to confirm.') !== 'DELETE') return;
-    await db.clearAll();
-    toast('All data deleted');
+    const v = await askDialog({ title: 'Delete all patient data?', text: 'This permanently deletes ALL your patients, notes and recordings on this device. Type DELETE to confirm.', fields: [{ name: 'c', label: 'Type DELETE', type: 'text' }], ok: 'Delete everything', danger: true });
+    if (!v || v.c !== 'DELETE') return;
+    await db.clearPatientData();
+    toast('All patient data deleted');
     location.hash = '#/';
   };
+
+  // --- account actions ---
+  $('#chPw').onclick = async () => {
+    const v = await askDialog({ title: 'Change password', fields: [{ name: 'o', label: 'Current password', ac: 'current-password' }, { name: 'n', label: 'New password', ac: 'new-password' }, { name: 'n2', label: 'Repeat new password', ac: 'new-password' }], ok: 'Change password' });
+    if (!v) return;
+    if (v.n !== v.n2) return toast('New passwords do not match.', true);
+    try { await auth.changePassword(session.user.username, v.o, v.n); toast('Password changed'); } catch (e) { toast(e.message, true); }
+  };
+  $('#newRec').onclick = async () => {
+    const v = await askDialog({ title: 'New recovery key', text: 'This replaces your old recovery key.', fields: [{ name: 'p', label: 'Your password', ac: 'current-password' }], ok: 'Generate' });
+    if (!v) return;
+    try { await showRecoveryKey(await auth.newRecoveryKey(session.user.username, v.p), session.user.username, () => route()); } catch (e) { toast(e.message, true); }
+  };
+  $('#delAcct').onclick = async () => {
+    const v = await askDialog({ title: 'Delete my account', text: 'Permanently deletes your account and ALL of your encrypted patient data from this device. This cannot be undone. Export a backup first if you need one.', fields: [{ name: 'p', label: 'Your password', ac: 'current-password' }, { name: 'c', label: 'Type DELETE', type: 'text' }], ok: 'Delete account', danger: true });
+    if (!v) return;
+    if (v.c !== 'DELETE') return toast('Type DELETE to confirm.', true);
+    try {
+      const id = await auth.removeAccount(session.user.username, v.p);
+      await runCleanups();
+      session = null; db.lock(); detachSettings(); renderUserbox(); stopIdle();
+      await db.destroyUserDb(id);
+      toast('Account deleted');
+      authView('login');
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+// ---------- modal dialog ----------
+function askDialog({ title, text = '', fields = [], ok = 'Continue', danger = false }) {
+  return new Promise((resolve) => {
+    const d = document.createElement('dialog');
+    d.className = 'modal';
+    d.innerHTML = `<form method="dialog" class="stack"><h2>${esc(title)}</h2>${text ? `<p class="muted small" style="margin:0">${esc(text)}</p>` : ''}
+      ${fields.map((f) => `<div><label>${esc(f.label)}<input name="${f.name}" type="${f.type || 'password'}" autocomplete="${f.ac || 'off'}" required style="margin-top:.25rem"></label></div>`).join('')}
+      <div class="row" style="justify-content:flex-end"><button type="button" class="btn" value="cancel">Cancel</button><button class="btn ${danger ? 'danger' : 'primary'}" value="ok">${esc(ok)}</button></div></form>`;
+    document.body.appendChild(d);
+    let result = null;
+    const form = $('form', d);
+    form.addEventListener('submit', (e) => { e.preventDefault(); result = Object.fromEntries(new FormData(form)); d.close(); });
+    $('button[value=cancel]', d).onclick = () => d.close();
+    d.addEventListener('close', () => { d.remove(); resolve(result); });
+    d.showModal();
+    d.querySelector('input')?.focus();
+  });
+}
+
+// ---------- accounts: sign in / sign up / recovery ----------
+let session = null;       // { user: {id, username, displayName} }
+let lastUserId = null;    // so an auto-lock returns the same person to where they were
+
+function renderUserbox() {
+  const box = document.getElementById('userbox');
+  const nav = document.querySelector('.topbar nav');
+  nav.hidden = !session;
+  box.innerHTML = session ? `<span class="userchip" title="@${esc(session.user.username)}"><span class="uav" aria-hidden="true">${esc(session.user.displayName[0].toUpperCase())}</span><span class="uname">${esc(session.user.displayName)}</span></span><button class="btn sm white" id="lockBtn" title="Lock now">🔒 Lock</button><button class="btn sm ghost" id="outBtn" style="color:#fff">Sign out</button>` : '';
+  if (session) {
+    $('#lockBtn', box).onclick = () => lockApp('Locked.');
+    $('#outBtn', box).onclick = () => lockApp('Signed out.', true);
+  }
+}
+
+async function lockApp(notice, signOut = false) {
+  if (!session) return;
+  stopIdle();
+  await runCleanups(); // flushes autosave and stops any recording before the key is dropped
+  lastUserId = signOut ? null : session.user.id;
+  session = null;
+  db.lock();
+  detachSettings();
+  document.getElementById('toast').hidden = true;
+  renderUserbox();
+  authView('login', { notice });
+}
+
+async function startSession(user, key) {
+  await db.openUser(user.id, key);
+  const saved = await db.get('settings', 'main').catch(() => null);
+  const { id: _id, ...rest } = saved || {};
+  attachSettings(rest, (o) => db.put('settings', { id: 'main', ...o }).catch((e) => console.error(e)));
+  session = { user };
+  renderUserbox();
+  startIdle();
+  if (user.id !== lastUserId) history.replaceState(null, '', '#/');
+  lastUserId = user.id;
+  await route();
+}
+
+const busyBtn = (btn, on, label) => { btn.disabled = on; btn.innerHTML = on ? `<span class="spinner"></span> ${label}` : btn.dataset.label; };
+
+function authView(mode, opts = {}) {
+  const accounts = auth.listAccounts();
+  if (!mode) mode = accounts.length ? 'login' : 'signup';
+  document.title = 'PhysioNotes';
+  const shell = (inner) => { app.innerHTML = `<div class="auth"><div class="card auth-card"><div class="auth-logo" aria-hidden="true">✚</div>${inner}<p class="disclaimer" style="text-align:center">🔒 Everything you enter is encrypted on this device with your password.</p></div></div>`; };
+  const err = (msg) => { const e = $('#authErr'); e.textContent = msg; e.hidden = !msg; };
+  const field = (id, label, type = 'text', ac = 'off', extra = '') => `<div><label for="${id}">${label}</label><input id="${id}" name="${id}" type="${type}" autocomplete="${ac}" required ${extra}></div>`;
+
+  if (mode === 'login') {
+    shell(`<h1>Welcome back</h1><p class="muted" style="margin-top:0">${opts.notice ? esc(opts.notice) + ' ' : ''}Sign in to open your patients.</p>
+      ${accounts.length ? `<div class="picker">${accounts.map((a) => `<button type="button" class="pick" data-u="${esc(a.username)}"><span class="uav">${esc(a.displayName[0].toUpperCase())}</span>${esc(a.displayName)}</button>`).join('')}</div>` : ''}
+      <form id="af" class="stack">${field('username', 'Username', 'text', 'username', 'autocapitalize="none" spellcheck="false"')}${field('password', 'Password', 'password', 'current-password')}
+      <div id="authErr" class="banner danger" role="alert" hidden></div>
+      <button class="btn primary" id="go" data-label="Sign in" type="submit">Sign in</button></form>
+      <div class="row between small" style="margin-top:.8rem"><a href="#" id="toRecover">Forgot password?</a><a href="#" id="toSignup">Create an account</a></div>`);
+    $$('.pick').forEach((b) => (b.onclick = () => { $('#username').value = b.dataset.u; $('#password').focus(); }));
+    if (accounts.length === 1) $('#username').value = accounts[0].username;
+    (accounts.length === 1 ? $('#password') : $('#username')).focus();
+    $('#toSignup').onclick = (e) => { e.preventDefault(); authView('signup'); };
+    $('#toRecover').onclick = (e) => { e.preventDefault(); authView('recover'); };
+    $('#af').onsubmit = async (e) => {
+      e.preventDefault(); err('');
+      busyBtn($('#go'), true, 'Unlocking…');
+      try { const { user, key } = await auth.logIn($('#username').value, $('#password').value); await startSession(user, key); }
+      catch (x) { err(x.message); busyBtn($('#go'), false); $('#password').value = ''; $('#password').focus(); }
+    };
+  } else if (mode === 'signup') {
+    shell(`<h1>${accounts.length ? 'Create your account' : 'Set up PhysioNotes'}</h1>
+      <p class="muted" style="margin-top:0">Each clinician has a private account. Patients and notes you add are visible <strong>only to you</strong>.</p>
+      <form id="af" class="stack">${field('displayName', 'Your name', 'text', 'name', 'placeholder="e.g. Sam Patel, RPT"')}${field('username', 'Username', 'text', 'username', 'autocapitalize="none" spellcheck="false" placeholder="letters and numbers"')}
+      ${field('password', `Password (min ${auth.MIN_PASSWORD} characters)`, 'password', 'new-password')}${field('password2', 'Repeat password', 'password', 'new-password')}
+      <div class="warnbox">There’s no central server, so <strong>nobody can reset your password for you</strong>. You’ll get a one-time recovery key on the next screen — keep it somewhere safe.</div>
+      <div id="authErr" class="banner danger" role="alert" hidden></div>
+      <button class="btn primary" id="go" data-label="Create account" type="submit">Create account</button></form>
+      ${accounts.length ? '<p class="small" style="text-align:center"><a href="#" id="toLogin">Back to sign in</a></p>' : ''}`);
+    $('#toLogin')?.addEventListener('click', (e) => { e.preventDefault(); authView('login'); });
+    $('#displayName').focus();
+    $('#af').onsubmit = async (e) => {
+      e.preventDefault(); err('');
+      if ($('#password').value !== $('#password2').value) return err('Passwords do not match.');
+      busyBtn($('#go'), true, 'Creating encrypted account…');
+      try {
+        const r = await auth.signUp({ username: $('#username').value, displayName: $('#displayName').value, password: $('#password').value });
+        await showRecoveryKey(r.recoveryKey, r.user.username, () => startSession(r.user, r.key));
+      } catch (x) { err(x.message); busyBtn($('#go'), false); }
+    };
+  } else if (mode === 'recover') {
+    shell(`<h1>Reset password</h1><p class="muted" style="margin-top:0">Enter the recovery key you saved when you created your account.</p>
+      <form id="af" class="stack">${field('username', 'Username', 'text', 'username', 'autocapitalize="none"')}${field('rkey', 'Recovery key', 'text', 'off', 'placeholder="XXXX-XXXX-XXXX-…" spellcheck="false" autocapitalize="characters"')}
+      ${field('password', `New password (min ${auth.MIN_PASSWORD} characters)`, 'password', 'new-password')}
+      <div id="authErr" class="banner danger" role="alert" hidden></div>
+      <button class="btn primary" id="go" data-label="Reset password" type="submit">Reset password</button></form>
+      <p class="small" style="text-align:center"><a href="#" id="toLogin">Back to sign in</a></p>`);
+    $('#toLogin').onclick = (e) => { e.preventDefault(); authView('login'); };
+    $('#af').onsubmit = async (e) => {
+      e.preventDefault(); err('');
+      busyBtn($('#go'), true, 'Resetting…');
+      try {
+        const u = $('#username').value;
+        const r = await auth.resetWithRecovery(u, $('#rkey').value, $('#password').value);
+        await showRecoveryKey(r.recoveryKey, u, () => authView('login', { notice: 'Password reset — please sign in.' }), 'Password reset. Your old recovery key no longer works — save this new one.');
+      } catch (x) { err(x.message); busyBtn($('#go'), false); }
+    };
+  }
+}
+
+function showRecoveryKey(key, username, next, heading = 'Save your recovery key') {
+  return new Promise((resolve) => {
+    app.innerHTML = `<div class="auth"><div class="card auth-card stack"><div class="auth-logo" aria-hidden="true">🔑</div><h1>${esc(heading)}</h1>
+      <p class="muted" style="margin:0">If you forget your password, this key is the <strong>only</strong> way back into your patient data. It is shown once. Store it in a password manager or print it and keep it somewhere safe — not on this computer’s desktop.</p>
+      <div class="reckey" id="rk" aria-label="Recovery key">${esc(key)}</div>
+      <div class="row"><button class="btn" id="dlKey">⬇ Download</button><button class="btn" id="cpKey">Copy</button><button class="btn" id="prKey">Print</button></div>
+      <label class="check"><input type="checkbox" id="saved"> I’ve saved my recovery key somewhere safe</label>
+      <button class="btn primary" id="cont" disabled>Continue</button></div></div>`;
+    $('#saved').onchange = (e) => ($('#cont').disabled = !e.target.checked);
+    $('#dlKey').onclick = () => download('physionotes-recovery-key.txt', new Blob([`PhysioNotes recovery key for @${username}
+
+${key}
+
+Keep this private. Anyone with it and your username can reset your password.
+`], { type: 'text/plain' }));
+    $('#cpKey').onclick = () => navigator.clipboard?.writeText(key).then(() => toast('Copied'), () => toast('Copy failed — select and copy manually.', true));
+    $('#prKey').onclick = () => window.print();
+    $('#cont').onclick = async () => { await next(); resolve(); };
+  });
+}
+
+// ---------- auto-lock ----------
+let lastActive = Date.now();
+let idleTimer = null;
+const bump = () => { lastActive = Date.now(); };
+const ACTIVITY = ['pointerdown', 'keydown', 'touchstart', 'scroll', 'input'];
+function idleCheck() {
+  if (!session || recordingActive) return;
+  if (Date.now() - lastActive > (getSettings().lockMinutes || 10) * 60000) lockApp('Locked after inactivity.');
+}
+function startIdle() {
+  lastActive = Date.now();
+  ACTIVITY.forEach((ev) => window.addEventListener(ev, bump, { passive: true, capture: true }));
+  idleTimer = setInterval(idleCheck, 10000);
+  document.addEventListener('visibilitychange', idleCheck);
+}
+function stopIdle() {
+  ACTIVITY.forEach((ev) => window.removeEventListener(ev, bump, { capture: true }));
+  clearInterval(idleTimer);
+  document.removeEventListener('visibilitychange', idleCheck);
 }
 
 // ---------- boot ----------
 if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
 navigator.storage?.persist?.().catch(() => {});
-route();
+renderUserbox();
+route(); // not signed in yet -> shows the sign-in / set-up screen

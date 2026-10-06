@@ -6,7 +6,6 @@ import { analyze, sortVisits, toMarkdown, STATUS_LABEL } from './analysis.js';
 import { age, blobToBase64 } from './util.js';
 import { toWavChunks } from './voice.js';
 
-const KEY = 'physio-notes-settings';
 export const DEFAULTS = {
   provider: 'gemini',
   geminiKey: '',
@@ -15,13 +14,18 @@ export const DEFAULTS = {
   ollamaModel: 'llama3.1',
   deidentify: true,
   speechLang: 'en-CA',
+  lockMinutes: 10,
 };
 
-export function getSettings() {
-  try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(KEY) || '{}') }; } catch { return { ...DEFAULTS }; }
-}
+// Settings (incl. the Gemini API key) live in the signed-in user's encrypted database, never in plain localStorage.
+let cache = { ...DEFAULTS };
+let persist = null;
+export function attachSettings(saved, persistFn) { cache = { ...DEFAULTS, ...(saved || {}) }; persist = persistFn; }
+export function detachSettings() { cache = { ...DEFAULTS }; persist = null; }
+export function getSettings() { return { ...cache }; }
 export function saveSettings(s) {
-  try { localStorage.setItem(KEY, JSON.stringify(s)); } catch { /* storage unavailable */ }
+  cache = { ...DEFAULTS, ...s };
+  persist?.({ ...cache });
 }
 export const providerLabel = (p) => ({ local: 'Built-in (offline)', gemini: 'Google Gemini', ollama: 'Ollama (local)' }[p] || p);
 export const geminiReady = (s = getSettings()) => s.provider === 'gemini' && !!s.geminiKey;
