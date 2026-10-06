@@ -1,5 +1,5 @@
 // Offline app shell. Network-first so updates arrive; falls back to cache when offline.
-const CACHE = 'physio-notes-v1';
+const CACHE = 'physio-notes-v2';
 const SHELL = ['./', 'index.html', 'css/styles.css', 'js/app.js', 'js/db.js', 'js/util.js', 'js/analysis.js', 'js/ai.js', 'js/voice.js', 'js/charts.js', 'manifest.webmanifest', 'icons/icon.svg'];
 
 self.addEventListener('install', (e) => {

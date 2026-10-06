@@ -8,7 +8,7 @@ import { toWavChunks } from './voice.js';
 
 const KEY = 'physio-notes-settings';
 export const DEFAULTS = {
-  provider: 'local',
+  provider: 'gemini',
   geminiKey: '',
   geminiModel: 'gemini-flash-latest',
   ollamaUrl: 'http://localhost:11434',
@@ -23,7 +23,8 @@ export function getSettings() {
 export function saveSettings(s) {
   try { localStorage.setItem(KEY, JSON.stringify(s)); } catch { /* storage unavailable */ }
 }
-export const providerLabel = (p) => ({ local: 'Built-in (offline)', gemini: 'Google Gemini (free tier)', ollama: 'Ollama (local)' }[p] || p);
+export const providerLabel = (p) => ({ local: 'Built-in (offline)', gemini: 'Google Gemini', ollama: 'Ollama (local)' }[p] || p);
+export const geminiReady = (s = getSettings()) => s.provider === 'gemini' && !!s.geminiKey;
 export const isCloud = (p) => p === 'gemini';
 
 // --- De-identification (applied before anything is sent to a cloud provider) -------------------
@@ -97,12 +98,32 @@ async function post(url, headers, body, signal) {
   return res.json();
 }
 
+const GEMINI = 'https://generativelanguage.googleapis.com/v1beta';
+
+// Calls Gemini; if the configured model name is unknown (404) picks an available Flash model once and retries.
+async function gemini(s, body, signal) {
+  if (!s.geminiKey) throw new Error('Add your free Gemini API key in Settings first.');
+  const url = (m) => `${GEMINI}/models/${encodeURIComponent(m)}:generateContent`;
+  const headers = { 'x-goog-api-key': s.geminiKey };
+  try {
+    return await post(url(s.geminiModel), headers, body, signal);
+  } catch (e) {
+    if (!/error 404/.test(e.message)) throw e;
+    const res = await fetch(`${GEMINI}/models?pageSize=100`, { headers });
+    if (!res.ok) throw e;
+    const models = ((await res.json()).models || []).filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'));
+    const pick = models.find((m) => /flash/i.test(m.name) && !/(lite|image|tts|live|thinking|exp)/i.test(m.name)) || models[0];
+    if (!pick) throw e;
+    const name = pick.name.replace(/^models\//, '');
+    saveSettings({ ...getSettings(), geminiModel: name });
+    return post(url(name), headers, body, signal);
+  }
+}
+
 async function callLLM(s, system, user, { json = false, signal } = {}) {
   if (s.provider === 'gemini') {
-    if (!s.geminiKey) throw new Error('Add your free Gemini API key in Settings first.');
-    const data = await post(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(s.geminiModel)}:generateContent`,
-      { 'x-goog-api-key': s.geminiKey },
+    const data = await gemini(
+      s,
       {
         systemInstruction: { parts: [{ text: system }] },
         contents: [{ role: 'user', parts: [{ text: user }] }],
@@ -128,10 +149,10 @@ async function callLLM(s, system, user, { json = false, signal } = {}) {
 
 // --- Public API --------------------------------------------------------------------------------
 
-export async function runReview(patient, visits, { question = '', signal } = {}) {
+export async function runReview(patient, visits, { question = '', signal, forceLocal = false } = {}) {
   const s = getSettings();
   const a = analyze(patient, visits);
-  if (s.provider === 'local') {
+  if (s.provider === 'local' || forceLocal) {
     return { text: toMarkdown(a), provider: 'local' };
   }
   const scrub = makeScrubber(patient, s.deidentify || false);
@@ -168,9 +189,8 @@ export async function transcribeAudio(blob, { signal } = {}) {
   const chunks = await toWavChunks(blob);
   const parts = [];
   for (const c of chunks) {
-    const data = await post(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(s.geminiModel)}:generateContent`,
-      { 'x-goog-api-key': s.geminiKey },
+    const data = await gemini(
+      s,
       { contents: [{ role: 'user', parts: [{ text: 'Transcribe this physiotherapy session dictation verbatim. Output only the transcript text, no commentary.' }, { inlineData: { mimeType: 'audio/wav', data: await blobToBase64(c) } }] }], generationConfig: { temperature: 0 } },
       signal
     );

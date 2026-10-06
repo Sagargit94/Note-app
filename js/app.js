@@ -26,6 +26,17 @@ async function runCleanups() {
 }
 const fullName = (p) => `${p.firstName || ''} ${p.lastName || ''}`.trim() || 'Unnamed patient';
 const VISIT_TYPES = { initial: 'Initial assessment', 'follow-up': 'Follow-up', reassessment: 'Re-assessment', discharge: 'Discharge' };
+const hue = (str) => { let h = 0; for (const c of str) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
+const initials = (p) => ((p.firstName || '?')[0] + (p.lastName || '')[0]).toUpperCase();
+const avatar = (p, cls = '') => `<span class="avatar ${cls}" style="--h:${hue(fullName(p))}" aria-hidden="true">${esc(initials(p))}</span>`;
+function spark(points) {
+  if (points.length < 2) return '';
+  const xs = points.map((q) => q.t), t0 = Math.min(...xs), t1 = Math.max(...xs) || 1;
+  const X = (t) => 4 + ((t - t0) / (t1 - t0 || 1)) * 76, Y = (y) => 24 - (y / 10) * 20;
+  const d = points.map((q, i) => `${i ? 'L' : 'M'}${X(q.t).toFixed(1)},${Y(q.y).toFixed(1)}`).join(' ');
+  const l = points[points.length - 1];
+  return `<svg class="spark" viewBox="0 0 84 28" aria-hidden="true"><path d="${d}"/><circle cx="${X(l.t).toFixed(1)}" cy="${Y(l.y).toFixed(1)}" r="2.8"/></svg>`;
+}
 const STATUS_BADGE = { 'on-track': 'ok', improving: 'ok', slow: 'warn', plateau: 'warn', worsening: 'danger', baseline: '', 'no-data': 'gray' };
 
 function notFound() {
@@ -67,13 +78,21 @@ async function patientsView() {
     return { p, a, last, activity: last ? new Date(last.date).getTime() : p.createdAt ? new Date(p.createdAt).getTime() : 0 };
   }).sort((x, y) => y.activity - x.activity);
 
+  const hr = new Date().getHours();
+  const weekAgo = Date.now() - 7 * 86400000;
+  const activeCount = patients.filter((p) => (p.status || 'active') === 'active').length;
+  const weekVisits = visits.filter((v) => new Date(v.date).getTime() >= weekAgo).length;
+  const attention = rows.filter(({ p, a }) => (p.status || 'active') === 'active' && (a.alerts.length || a.flags.length)).length;
+  const st = getSettings();
   app.innerHTML = `
-    <div class="row between" style="margin-bottom:1rem">
-      <h1>Patients <span class="muted small">(${patients.length})</span></h1>
-      <a class="btn primary" href="#/patient/new">+ New patient</a>
-    </div>
+    <section class="hero">
+      <div class="row between"><div><h1>${hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening'} 👋</h1><p>Here’s your caseload at a glance.</p></div>
+        <a class="btn white" href="#/patient/new">+ New patient</a></div>
+      <div class="stats"><div class="stat"><b>${activeCount}</b><span>Active patients</span></div><div class="stat"><b>${weekVisits}</b><span>Visits this week</span></div><div class="stat"><b>${attention}</b><span>Need attention</span></div></div>
+    </section>
+    ${st.provider === 'gemini' && !st.geminiKey ? `<div class="setup row between"><div><strong>✨ Turn on your free AI assistant</strong><div class="small">Connect Google Gemini in about a minute to get treatment recommendations and dictation-to-notes.</div></div><a class="btn sm primary" href="#/settings">Set up</a></div>` : ''}
     <div class="row" style="margin-bottom:1rem">
-      <input id="q" class="grow" type="search" placeholder="Search name, condition, phone…" aria-label="Search patients">
+      <input id="q" class="grow" type="search" placeholder="🔍  Search name, condition, phone…" aria-label="Search patients">
       <select id="filter" style="width:auto" aria-label="Filter by status">
         <option value="active">Active</option><option value="discharged">Discharged</option><option value="all">All</option>
       </select>
@@ -88,17 +107,21 @@ async function patientsView() {
       (!q || [fullName(p), p.condition, p.phone, p.email].join(' ').toLowerCase().includes(q)));
     $('#list').innerHTML = shown.length
       ? shown.map(({ p, a, last }) => `
-        <li><a class="pitem" href="#/patient/${p.id}"><div class="card row between">
-          <div>
+        <li><a class="pitem" href="#/patient/${p.id}"><div class="card">
+          ${avatar(p)}
+          <div class="grow">
             <div class="pname">${esc(fullName(p))} ${p.status === 'discharged' ? '<span class="badge gray">Discharged</span>' : ''}</div>
             <div class="muted small">${[age(p.dob) != null ? age(p.dob) + ' y' : '', p.condition].filter(Boolean).map(esc).join(' · ') || 'No condition recorded'}</div>
             <div class="muted small">${a.visitCount} visit${a.visitCount === 1 ? '' : 's'}${last ? ' · last ' + fmtDate(last.date) : ''}</div>
           </div>
+          ${spark(series(byPatient.get(p.id) || [], 'pain'))}
           <div style="text-align:right">
             <span class="badge ${STATUS_BADGE[a.status]}">${STATUS_LABEL[a.status]}</span>
             ${a.alerts.length || a.flags.length ? '<div class="small bad" style="margin-top:.25rem">⚠ needs attention</div>' : ''}
           </div></div></a></li>`).join('')
-      : `<li class="card muted">${patients.length ? 'No patients match.' : 'No patients yet. Click “New patient” to add your first one.'}</li>`;
+      : patients.length ? '<li class="card muted">No patients match.</li>'
+      : `<li class="card empty"><svg viewBox="0 0 160 120" aria-hidden="true"><rect x="30" y="20" width="100" height="84" rx="14" fill="var(--brand-l)"/><circle cx="80" cy="52" r="16" fill="var(--brand)"/><path d="M52 94c4-16 52-16 56 0" fill="var(--brand)"/><path d="M122 18v18M113 27h18" stroke="var(--accent)" stroke-width="5" stroke-linecap="round"/></svg>
+          <h2>Add your first patient</h2><p class="muted">Create a profile, then record voice notes during the visit.</p><a class="btn primary" href="#/patient/new">+ New patient</a></li>`;
   };
   $('#q').addEventListener('input', draw);
   $('#filter').addEventListener('change', draw);
@@ -156,6 +179,7 @@ async function patientView(id) {
   const clipCounts = await Promise.all(visits.map((v) => db.countBy('audio', 'visitId', v.id)));
   const a = analyze(patient, visits);
   const settings = getSettings();
+  const gemOK = settings.provider !== 'gemini' || !!settings.geminiKey;
   const delta = (t, lowerBetter) => {
     if (!t || t.n < 2) return '<span class="d neutral">baseline</span>';
     const good = lowerBetter ? t.change < 0 : t.change > 0;
@@ -170,11 +194,11 @@ async function patientView(id) {
     <div class="stack">
     <div class="card">
       <div class="row between">
-        <div>
+        <div class="row" style="flex-wrap:nowrap">${avatar(patient, 'lg')}<div>
           <h1 style="margin:0">${esc(fullName(patient))} ${patient.status === 'discharged' ? '<span class="badge gray">Discharged</span>' : ''}</h1>
           <div class="muted">${[age(patient.dob) != null ? age(patient.dob) + ' y' : '', patient.sex, patient.occupation].filter(Boolean).map(esc).join(' · ')}</div>
           <div class="muted small">${[patient.phone, patient.email].filter(Boolean).map(esc).join(' · ')}</div>
-        </div>
+        </div></div>
         <div class="row">
           <a class="btn primary" href="#/patient/${id}/visit/new/${nextType}">${nextLabel}</a>
           <a class="btn" href="#/patient/${id}/edit">Edit</a>
@@ -209,15 +233,16 @@ async function patientView(id) {
       </div>
     </div>
 
-    <div class="card" id="aiCard">
+    <div class="card ai-card" id="aiCard">
       <div class="row between"><h2>✨ AI treatment assistant</h2><span class="badge">${esc(providerLabel(settings.provider))}</span></div>
       <p class="muted small" style="margin-top:0">Reviews every note, tracks progress and suggests the course of treatment.
-        ${settings.provider === 'local' ? 'Using the built-in offline reviewer. <a href="#/settings">Connect free Gemini or Ollama</a> for a richer narrative review.' : ''}
-        ${isCloud(settings.provider) ? (settings.deidentify ? 'Names, DOB and contact details are removed before sending.' : '<strong class="bad">De-identification is OFF.</strong>') : ''}</p>
+        ${isCloud(settings.provider) && gemOK ? (settings.deidentify ? 'Names, DOB and contact details are removed before sending.' : '<strong class="bad">De-identification is OFF.</strong>') : ''}</p>
+      ${gemOK ? '' : '<div class="setup"><strong>Connect Gemini to switch this on.</strong><div class="small">It’s free and takes about a minute. Until then you can still run the quick offline review.</div></div>'}
       <div class="row">
-        <button class="btn primary" id="reviewBtn" ${visits.length ? '' : 'disabled'}>Review progress &amp; recommend treatment</button>
+        ${gemOK ? `<button class="btn primary" id="reviewBtn" ${visits.length ? '' : 'disabled'}>Review progress &amp; recommend treatment</button>`
+          : `<a class="btn primary" href="#/settings">Connect free Gemini</a><button class="btn" id="offlineBtn" ${visits.length ? '' : 'disabled'}>Quick offline review</button>`}
       </div>
-      ${settings.provider !== 'local' ? `<div class="row" style="margin-top:.6rem"><input id="askQ" class="grow" placeholder="Ask about this patient, e.g. “How should I progress loading next visit?”"><button class="btn" id="askBtn" ${visits.length ? '' : 'disabled'}>Ask</button></div>` : ''}
+      ${gemOK && settings.provider !== 'local' ? `<div class="row" style="margin-top:.7rem"><input id="askQ" class="grow" placeholder="Ask about this patient, e.g. “How should I progress loading next visit?”"><button class="btn" id="askBtn" ${visits.length ? '' : 'disabled'}>Ask</button></div>` : ''}
       <div id="aiOut">${patient.lastReview ? `<div class="ai-out">${mdToHtml(patient.lastReview.text)}<div class="disclaimer">Saved review · ${fmtDateTime(patient.lastReview.at)} · ${esc(providerLabel(patient.lastReview.provider))}</div></div>` : ''}</div>
       <p class="disclaimer">AI output is decision support only. You remain responsible for clinical decisions and documentation.</p>
     </div>
@@ -250,22 +275,24 @@ async function patientView(id) {
   };
 
   const out = $('#aiOut');
-  const runAI = async (question) => {
+  const runAI = async (question, forceLocal = false) => {
     const btns = $$('#aiCard button');
     btns.forEach((b) => (b.disabled = true));
     out.innerHTML = '<p class="muted"><span class="spinner"></span> Reviewing notes…</p>';
     try {
-      const res = await runReview(patient, visits, { question });
+      const res = await runReview(patient, visits, { question, forceLocal });
       patient.lastReview = { at: new Date().toISOString(), provider: res.provider, text: res.text };
       await db.put('patients', patient);
       out.innerHTML = `<div class="ai-out">${mdToHtml(res.text)}<div class="disclaimer">${fmtDateTime(patient.lastReview.at)} · ${esc(providerLabel(res.provider))}</div></div>`;
     } catch (e) {
-      out.innerHTML = `<div class="banner danger" role="alert">${esc(e.message)}</div>`;
+      out.innerHTML = `<div class="banner danger" role="alert">${esc(e.message)}<div style="margin-top:.5rem"><button class="btn sm" id="fallbackBtn">Show offline review instead</button></div></div>`;
+      $('#fallbackBtn').onclick = () => runAI('', true);
     } finally {
       btns.forEach((b) => (b.disabled = false));
     }
   };
-  $('#reviewBtn').onclick = () => runAI('');
+  if ($('#reviewBtn')) $('#reviewBtn').onclick = () => runAI('');
+  if ($('#offlineBtn')) $('#offlineBtn').onclick = () => runAI('', true);
   if ($('#askBtn')) $('#askBtn').onclick = () => { const q = $('#askQ').value.trim(); if (q) runAI(q); };
 }
 
@@ -306,6 +333,7 @@ async function visitView(id, pid, requestedType) {
     prev = others.filter((x) => new Date(x.date) < new Date(v.date)).pop();
   }
   const settings = getSettings();
+  const chips = (f, cls, lo, hi) => `<div class="chips ${cls}" data-chips="${f}">${[...Array(11).keys()].map((n) => `<button type="button" class="chip ${v[f] === n ? 'on' : ''}" style="--n:${n}" data-n="${n}" aria-pressed="${v[f] === n}">${n}</button>`).join('')}</div><div class="scale"><span>${lo}</span><span>${hi}</span></div>`;
   const ta = (f, label, ph, rows = 4) => `<div><label for="${f}">${label}</label><textarea id="${f}" data-f="${f}" rows="${rows}" placeholder="${esc(ph)}">${esc(v[f])}</textarea></div>`;
 
   app.innerHTML = `
@@ -322,37 +350,36 @@ async function visitView(id, pid, requestedType) {
       <div class="card"><div class="grid2">
         <div><label for="date">Date &amp; time</label><input id="date" type="datetime-local" data-f="date" value="${toLocalInput(v.date)}"></div>
         <div><label for="type">Visit type</label><select id="type" data-f="type">${Object.entries(VISIT_TYPES).map(([k, n]) => `<option value="${k}" ${v.type === k ? 'selected' : ''}>${n}</option>`).join('')}</select></div>
-        <div><label for="pain">Pain now (0–10)</label><input id="pain" type="number" inputmode="decimal" min="0" max="10" step="0.5" data-f="pain" value="${v.pain ?? ''}" placeholder="NPRS"></div>
-        <div><label for="function">Function (0–10, 10 = fully able)</label><input id="function" type="number" inputmode="decimal" min="0" max="10" step="0.1" data-f="function" value="${v.function ?? ''}" placeholder="e.g. PSFS average"></div>
-      </div></div>
+      </div>
+      <div style="margin-top:1rem"><label>Pain right now — <b id="val-pain">${v.pain ?? '–'}</b>/10</label>${chips('pain', 'pain', 'No pain', 'Worst possible')}</div>
+      <div style="margin-top:1rem"><label>Function (ability to do daily tasks) — <b id="val-function">${v.function ?? '–'}</b>/10</label>${chips('function', 'func', 'Unable', 'Fully able')}</div></div>
 
-      <div class="card"><h2>🎙 Voice notes</h2>
-        <div class="rec-box">
-          <div class="row"><button type="button" class="btn rec" id="recBtn">● Start recording</button>
-            <span id="recLive" class="rec-live" hidden><i></i><span id="recTime">0:00</span></span></div>
-          <div class="interim" id="interim" aria-live="off"></div>
-          <div id="clips"></div>
-          <p class="small muted" style="margin-bottom:0">${!recordingSupported ? '⚠ Audio recording is not supported in this browser. ' : ''}${speechSupported ? 'Live transcription is on while recording (language: ' + esc(settings.speechLang) + ').' : 'Live transcription isn’t available in this browser; recordings are still saved. Use “Transcribe with AI” (Gemini) or type below.'}</p>
-        </div>
-        <div style="margin-top:.75rem"><label for="transcript">Transcript (editable)</label>
-          <textarea id="transcript" data-f="transcript" rows="6" placeholder="Transcripts of your recordings appear here. You can also type or use your keyboard’s dictation.">${esc(v.transcript)}</textarea></div>
-        <div class="row" style="margin-top:.5rem"><button type="button" class="btn sm" id="soapBtn">✨ Structure transcript into SOAP</button><span class="muted small" id="soapMsg"></span></div>
+      <div class="card mic-card"><h2>Voice notes</h2>
+        <button type="button" class="mic" id="recBtn" aria-label="Start recording">🎙</button>
+        <div id="recLabel" class="muted small" style="margin-top:.4rem">Tap to start recording</div>
+        <div class="rec-time" id="recLive" hidden><span id="recTime">0:00</span></div>
+        <div class="interim" id="interim" aria-live="off"></div>
+        <div id="clips"></div>
+        <p class="small muted" style="margin:.6rem 0 0">${!recordingSupported ? '⚠ Audio recording is not supported in this browser. ' : ''}${speechSupported ? 'Live transcription is on while recording (' + esc(settings.speechLang) + ').' : 'Live transcription isn’t available in this browser — recordings are still saved. Use “Transcribe with AI” or type below.'}</p>
+        <div style="margin-top:.9rem;text-align:left"><label for="transcript">Transcript (editable)</label>
+          <textarea id="transcript" data-f="transcript" rows="6" placeholder="Your recording’s transcript appears here. You can also type, or use your keyboard’s dictation.">${esc(v.transcript)}</textarea></div>
+        <div class="row" style="margin-top:.6rem;justify-content:flex-start"><button type="button" class="btn sm" id="soapBtn">✨ Turn transcript into SOAP note</button><span class="muted small" id="soapMsg"></span></div>
       </div>
 
       <div class="card"><h2>Clinical note</h2><div class="stack">
-        ${ta('subjective', 'Subjective — history, symptoms, patient report', 'Since last visit… aggravating / easing factors, sleep, function, adherence to HEP')}
-        ${ta('objective', 'Objective — observation, ROM, strength, special tests', 'Findings today')}
-        ${ta('assessment', 'Assessment — clinical impression, response to treatment', 'Progress vs. last visit and goals')}
-        ${ta('plan', 'Plan — next steps, frequency, referrals', 'Plan / next visit')}
+        ${ta('subjective', '<span class="soap-l">S</span>Subjective — what the patient reports', 'Since last visit… aggravating / easing factors, sleep, function, adherence to HEP')}
+        ${ta('objective', '<span class="soap-l">O</span>Objective — what you found', 'Findings today')}
+        ${ta('assessment', '<span class="soap-l">A</span>Assessment — your clinical impression', 'Progress vs. last visit and goals')}
+        ${ta('plan', '<span class="soap-l">P</span>Plan — next steps', 'Plan / next visit')}
         ${ta('treatment', 'Treatment provided today', 'Manual therapy, exercises, education…', 3)}
         ${ta('hep', 'Home exercise programme / advice', 'Exercises, sets × reps, frequency', 3)}
       </div></div>
 
-      <div class="card"><h2>Outcome measures</h2>
-        <p class="muted small" style="margin-top:0">ROM, strength, functional tests, questionnaire scores — tracked across visits. Names carry forward to the next visit.</p>
+      <details class="card" ${v.measures.length ? 'open' : ''}><summary><h2 style="display:inline">Outcome measures</h2> <span class="muted small">(ROM, strength, tests)</span></summary>
+        <p class="muted small" style="margin-top:.5rem">ROM, strength, functional tests, questionnaire scores — tracked across visits. Names carry forward to the next visit.</p>
         <div id="measures"></div>
         <button type="button" class="btn sm" id="addMeasure">+ Add measure</button>
-      </div>
+      </details>
 
       <div class="savebar">
         <button type="button" class="btn primary" id="finishBtn">Save &amp; finish</button>
@@ -391,6 +418,16 @@ async function visitView(id, pid, requestedType) {
   $('#vf').addEventListener('change', (e) => {
     if (e.target.dataset.mi !== undefined && e.target.dataset.mk === 'better') { v.measures[+e.target.dataset.mi].better = e.target.value; touch(); }
   });
+
+  $$('[data-chips]').forEach((box) => box.addEventListener('click', (e) => {
+    const b = e.target.closest('.chip');
+    if (!b) return;
+    const f = box.dataset.chips, n = +b.dataset.n;
+    v[f] = v[f] === n ? null : n;
+    $$('.chip', box).forEach((c) => { const on = v[f] === +c.dataset.n; c.classList.toggle('on', on); c.setAttribute('aria-pressed', on); });
+    $('#val-' + f).textContent = v[f] ?? '–';
+    touch();
+  }));
 
   // --- measures ---
   const drawMeasures = () => {
@@ -451,11 +488,18 @@ async function visitView(id, pid, requestedType) {
 
   // --- recording ---
   let recorder = null;
+  const setMic = (on) => {
+    const b = $('#recBtn');
+    b.textContent = on ? '■' : '🎙';
+    b.classList.toggle('live', on);
+    b.setAttribute('aria-label', on ? 'Stop recording' : 'Start recording');
+    $('#recLabel').textContent = on ? 'Recording… tap to stop & save' : 'Tap to start recording';
+    $('#recLive').hidden = !on;
+  };
   const stopRecording = async () => {
     const r = recorder;
     recorder = null;
-    $('#recBtn').textContent = '● Start recording';
-    $('#recLive').hidden = true;
+    setMic(false);
     $('#interim').textContent = '';
     const res = await r.stop();
     await save(); // make sure the visit exists before attaching audio
@@ -479,8 +523,7 @@ async function visitView(id, pid, requestedType) {
       return toast(e.name === 'NotAllowedError' ? 'Microphone permission denied. Allow it in your browser settings.' : 'Could not start recording: ' + e.message, true);
     }
     recorder = r;
-    $('#recBtn').textContent = '■ Stop & save';
-    $('#recLive').hidden = false;
+    setMic(true);
   };
   const warnUnload = (e) => { if (recorder) { e.preventDefault(); e.returnValue = ''; } };
   window.addEventListener('beforeunload', warnUnload);
@@ -527,26 +570,28 @@ async function visitView(id, pid, requestedType) {
 async function settingsView() {
   const s = getSettings();
   const est = navigator.storage?.estimate ? await navigator.storage.estimate().catch(() => null) : null;
-  const radio = (val, title, desc) => `<label class="check" style="align-items:flex-start;margin-bottom:.5rem"><input type="radio" name="provider" value="${val}" ${s.provider === val ? 'checked' : ''}><span><strong>${title}</strong><br><span class="muted small">${desc}</span></span></label>`;
+  const opt = (val, title, desc, tag = '') => `<label class="opt"><input type="radio" name="provider" value="${val}" ${s.provider === val ? 'checked' : ''}><span><strong>${title}</strong> ${tag}<br><span class="muted small">${desc}</span></span></label>`;
   app.innerHTML = `
     <h1>Settings</h1>
     <div class="stack">
-    <div class="card"><h2>AI assistant (free options)</h2>
-      ${radio('local', 'Built-in offline reviewer', 'Free, instant, fully private. Tracks pain/function/measure trends, plateaus, red-flag keywords and gives rule-based treatment suggestions. No account needed.')}
-      ${radio('gemini', 'Google Gemini (free tier)', 'Richer narrative review, treatment suggestions, dictation → SOAP, and audio transcription. Needs your own free API key from Google AI Studio. Data is sent to Google.')}
-      ${radio('ollama', 'Ollama (local model)', 'Free and private: runs an open-source model on your own computer (install from ollama.com, then <code>ollama pull llama3.1</code>). Start Ollama with <code>OLLAMA_ORIGINS=*</code> so the browser may call it.')}
-      <div id="geminiBox" class="stack" hidden style="margin-top:.75rem">
-        <div class="warnbox"><strong>Privacy:</strong> Gemini’s free tier is a consumer-grade service — Google’s terms allow free-tier inputs to be used to improve its products, and it is not a health-information custodian agreement. Only use it with patient consent and keep de-identification on, or use the offline / Ollama options. Check your regulator’s and privacy-law requirements (e.g. PHIPA / PIPEDA / provincial rules).</div>
-        <div class="grid2"><div><label for="gkey">Gemini API key</label><input id="gkey" type="password" autocomplete="off" value="${esc(s.geminiKey)}" placeholder="Paste key from aistudio.google.com/apikey"></div>
-        <div><label for="gmodel">Model</label><input id="gmodel" value="${esc(s.geminiModel)}"></div></div>
-        <p class="muted small" style="margin:0">The key is stored only in this browser. Create one free at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>.</p>
+    <div class="card"><h2>✨ AI assistant</h2>
+      ${opt('gemini', 'Google Gemini', 'Free. Written treatment recommendations, ask-anything about a patient, dictation → SOAP note, and audio transcription.', '<span class="badge ok">Recommended</span>')}
+      ${opt('local', 'Offline only', 'No account. Simple rule-based review of trends, plateaus and red-flag words. Nothing leaves your device.')}
+      ${opt('ollama', 'Ollama (advanced)', 'Runs an open-source model on your own computer. Private. Needs ollama.com installed and started with <code>OLLAMA_ORIGINS=*</code>.')}
+      <div id="geminiBox" class="stack" hidden style="margin-top:.9rem">
+        <div><strong>Connect Gemini in 3 steps</strong>
+          <ol class="steps"><li>Open <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio → API keys</a> and sign in with a Google account.</li>
+          <li>Click <em>Create API key</em> (the free tier needs no payment details) and copy it.</li><li>Paste it below, then press <em>Save &amp; test</em>.</li></ol></div>
+        <div><label for="gkey">Gemini API key</label><input id="gkey" type="password" autocomplete="off" value="${esc(s.geminiKey)}" placeholder="Paste your key here"></div>
+        <details><summary class="small">Advanced</summary><div style="margin-top:.5rem"><label for="gmodel">Model (auto-corrected if unavailable)</label><input id="gmodel" value="${esc(s.geminiModel)}"></div></details>
+        <div class="warnbox"><strong>Privacy:</strong> Gemini’s free tier sends your text/audio to Google, whose terms allow free-tier inputs to be used to improve its products — it is not a health-privacy-compliant arrangement. Use it with patient consent and keep de-identification on, and check your regulator’s rules (e.g. PHIPA / PIPEDA).</div>
       </div>
-      <div id="ollamaBox" class="grid2" hidden style="margin-top:.75rem">
+      <div id="ollamaBox" class="grid2" hidden style="margin-top:.9rem">
         <div><label for="ourl">Ollama URL</label><input id="ourl" value="${esc(s.ollamaUrl)}"></div>
         <div><label for="omodel">Model</label><input id="omodel" value="${esc(s.ollamaModel)}"></div>
       </div>
-      <label class="check" style="margin-top:.75rem"><input type="checkbox" id="deid" ${s.deidentify ? 'checked' : ''}> De-identify notes before sending to an AI model (removes names, emails, phone numbers, postal codes; sends age instead of DOB)</label>
-      <div class="row" style="margin-top:.75rem"><button class="btn primary" id="saveAI">Save</button><button class="btn" id="testAI">Test connection</button><span id="aiMsg" class="small muted"></span></div>
+      <label class="check" style="margin-top:1rem"><input type="checkbox" id="deid" ${s.deidentify ? 'checked' : ''}> Remove names, emails, phone numbers and postal codes before sending to an AI (sends age instead of date of birth)</label>
+      <div class="row" style="margin-top:1rem"><button class="btn primary" id="testAI">Save &amp; test</button><span id="aiMsg" class="small muted" aria-live="polite"></span></div>
     </div>
 
     <div class="card"><h2>Voice</h2>
@@ -571,10 +616,7 @@ async function settingsView() {
     $('#geminiBox').hidden = p !== 'gemini';
     $('#ollamaBox').hidden = p !== 'ollama';
   };
-  $$('input[name=provider]').forEach((r) => r.addEventListener('change', () => {
-    showBoxes();
-    if (r.value === 'gemini' && r.checked) alert('Reminder: Gemini’s free tier sends data to Google and may use it to improve its products. Use only with patient consent, keep de-identification on, and prefer the offline or Ollama option for identifiable details.');
-  }));
+  $$('input[name=provider]').forEach((r) => r.addEventListener('change', () => { showBoxes(); saveSettings(collect()); }));
   showBoxes();
   const collect = () => ({
     ...getSettings(),
@@ -584,11 +626,11 @@ async function settingsView() {
     deidentify: $('#deid').checked, speechLang: $('#lang').value,
   });
   $('#lang').onchange = () => saveSettings(collect());
-  $('#saveAI').onclick = () => { saveSettings(collect()); $('#aiMsg').textContent = 'Saved.'; toast('Settings saved'); };
   $('#testAI').onclick = async () => {
     saveSettings(collect());
+    if (collect().provider === 'local') { $('#aiMsg').textContent = '✓ Saved.'; return; }
     $('#aiMsg').innerHTML = '<span class="spinner"></span> Testing…';
-    try { $('#aiMsg').textContent = await testConnection(); } catch (e) { $('#aiMsg').textContent = '✗ ' + e.message; }
+    try { $('#aiMsg').textContent = '✓ ' + await testConnection(); } catch (e) { $('#aiMsg').textContent = '✗ ' + e.message; }
   };
 
   const exportAll = async (withAudio) => {

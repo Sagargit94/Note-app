@@ -21,14 +21,19 @@ A private, local-first notes app for physiotherapists. Installable as a PWA (pho
 
 ## Run it
 
-```bash
-npm start            # = python3 -m http.server 8080, then open http://localhost:8080
-npm test             # unit tests for the analysis engine
-```
+PhysioNotes is a static website. It must be *served* (opening `index.html` by double-click does not work because browsers block modules and the microphone on `file://`).
 
-Microphone access needs a secure context: `localhost` works, otherwise serve over **HTTPS** (e.g. GitHub Pages, Netlify, Cloudflare Pages — it's a static site). Open it on your phone and use *Add to Home Screen* to install.
+**Windows:** unzip the folder and double-click **`start.bat`** — it opens http://localhost:8080 (uses Node or Python if installed, otherwise built-in PowerShell; nothing to install).
+**Mac/Linux:** double-click/run `start.command`, or `node serve.mjs` / `python3 -m http.server 8080`.
+**On your phone / anywhere (recommended):** host it over HTTPS — a GitHub Pages workflow is included (`.github/workflows/pages.yml`). In the repo: *Settings → Pages → Source: GitHub Actions*, merge to `main`, and open the published link. Then use *Add to Home Screen* to install it. (Note: each device/browser keeps its own separate data.)
 
-For Ollama, start it with `OLLAMA_ORIGINS=*` so the browser may call it.
+`npm test` runs the unit tests for the analysis engine.
+
+## Set up the free Gemini AI
+
+1. Open <https://aistudio.google.com/apikey> and sign in with a Google account.
+2. *Create API key* (free tier, no payment details) and copy it.
+3. In PhysioNotes → **Settings**, paste it and press **Save & test**.
 
 ## Privacy & compliance — please read
 
