@@ -1,0 +1,632 @@
+import * as db from './db.js';
+import { esc, uid, fmtDate, fmtDateTime, fmtDur, age, debounce, toLocalInput, fromLocalInput, mdToHtml, download, blobToBase64, base64ToBlob } from './util.js';
+import { analyze, sortVisits, series, STATUS_LABEL } from './analysis.js';
+import { lineChart } from './charts.js';
+import { getSettings, saveSettings, runReview, runSoap, transcribeAudio, testConnection, providerLabel, isCloud } from './ai.js';
+import { Recorder, speechSupported, recordingSupported } from './voice.js';
+
+const app = document.getElementById('app');
+const $ = (sel, root = app) => root.querySelector(sel);
+const $$ = (sel, root = app) => [...root.querySelectorAll(sel)];
+
+// ---------- helpers ----------
+let toastTimer;
+function toast(msg, isError = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast' + (isError ? ' error' : '');
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (t.hidden = true), isError ? 6000 : 2800);
+}
+const cleanups = [];
+const onLeave = (fn) => cleanups.push(fn);
+async function runCleanups() {
+  while (cleanups.length) { try { await cleanups.pop()(); } catch (e) { console.error(e); } }
+}
+const fullName = (p) => `${p.firstName || ''} ${p.lastName || ''}`.trim() || 'Unnamed patient';
+const VISIT_TYPES = { initial: 'Initial assessment', 'follow-up': 'Follow-up', reassessment: 'Re-assessment', discharge: 'Discharge' };
+const STATUS_BADGE = { 'on-track': 'ok', improving: 'ok', slow: 'warn', plateau: 'warn', worsening: 'danger', baseline: '', 'no-data': 'gray' };
+
+function notFound() {
+  app.innerHTML = '<div class="card"><h2>Not found</h2><p>That record does not exist (it may have been deleted).</p><a class="btn" href="#/">Back to patients</a></div>';
+}
+
+// ---------- router ----------
+async function route() {
+  await runCleanups();
+  const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
+  $$('[data-nav]', document).forEach((a) => a.classList.toggle('active', a.dataset.nav === (parts[0] === 'settings' ? 'settings' : 'patients')));
+  try {
+    if (!parts.length) await patientsView();
+    else if (parts[0] === 'settings') await settingsView();
+    else if (parts[0] === 'patient' && parts[1] === 'new') await patientForm();
+    else if (parts[0] === 'patient' && parts[2] === 'edit') await patientForm(parts[1]);
+    else if (parts[0] === 'patient' && parts[2] === 'visit' && parts[3] === 'new') await visitView(null, parts[1], parts[4]);
+    else if (parts[0] === 'patient') await patientView(parts[1]);
+    else if (parts[0] === 'visit') await visitView(parts[1]);
+    else notFound();
+  } catch (e) {
+    console.error(e);
+    app.innerHTML = `<div class="card"><h2>Something went wrong</h2><p>${esc(e.message)}</p><a class="btn" href="#/">Back</a></div>`;
+  }
+  window.scrollTo(0, 0);
+  app.focus({ preventScroll: true });
+}
+window.addEventListener('hashchange', route);
+
+// ---------- patients list ----------
+async function patientsView() {
+  const [patients, visits] = await Promise.all([db.getAll('patients'), db.getAll('visits')]);
+  const byPatient = new Map();
+  visits.forEach((v) => byPatient.set(v.patientId, [...(byPatient.get(v.patientId) || []), v]));
+  const rows = patients.map((p) => {
+    const vs = byPatient.get(p.id) || [];
+    const a = analyze(p, vs);
+    const last = sortVisits(vs).pop();
+    return { p, a, last, activity: last ? new Date(last.date).getTime() : p.createdAt ? new Date(p.createdAt).getTime() : 0 };
+  }).sort((x, y) => y.activity - x.activity);
+
+  app.innerHTML = `
+    <div class="row between" style="margin-bottom:1rem">
+      <h1>Patients <span class="muted small">(${patients.length})</span></h1>
+      <a class="btn primary" href="#/patient/new">+ New patient</a>
+    </div>
+    <div class="row" style="margin-bottom:1rem">
+      <input id="q" class="grow" type="search" placeholder="Search name, condition, phone…" aria-label="Search patients">
+      <select id="filter" style="width:auto" aria-label="Filter by status">
+        <option value="active">Active</option><option value="discharged">Discharged</option><option value="all">All</option>
+      </select>
+    </div>
+    <ul class="plist" id="list"></ul>`;
+
+  const draw = () => {
+    const q = $('#q').value.trim().toLowerCase();
+    const f = $('#filter').value;
+    const shown = rows.filter(({ p }) =>
+      (f === 'all' || (p.status || 'active') === f) &&
+      (!q || [fullName(p), p.condition, p.phone, p.email].join(' ').toLowerCase().includes(q)));
+    $('#list').innerHTML = shown.length
+      ? shown.map(({ p, a, last }) => `
+        <li><a class="pitem" href="#/patient/${p.id}"><div class="card row between">
+          <div>
+            <div class="pname">${esc(fullName(p))} ${p.status === 'discharged' ? '<span class="badge gray">Discharged</span>' : ''}</div>
+            <div class="muted small">${[age(p.dob) != null ? age(p.dob) + ' y' : '', p.condition].filter(Boolean).map(esc).join(' · ') || 'No condition recorded'}</div>
+            <div class="muted small">${a.visitCount} visit${a.visitCount === 1 ? '' : 's'}${last ? ' · last ' + fmtDate(last.date) : ''}</div>
+          </div>
+          <div style="text-align:right">
+            <span class="badge ${STATUS_BADGE[a.status]}">${STATUS_LABEL[a.status]}</span>
+            ${a.alerts.length || a.flags.length ? '<div class="small bad" style="margin-top:.25rem">⚠ needs attention</div>' : ''}
+          </div></div></a></li>`).join('')
+      : `<li class="card muted">${patients.length ? 'No patients match.' : 'No patients yet. Click “New patient” to add your first one.'}</li>`;
+  };
+  $('#q').addEventListener('input', draw);
+  $('#filter').addEventListener('change', draw);
+  draw();
+}
+
+// ---------- patient form ----------
+async function patientForm(id) {
+  const p = id ? await db.get('patients', id) : { status: 'active' };
+  if (id && !p) return notFound();
+  const f = (name, label, type = 'text', extra = '') =>
+    `<div><label for="${name}">${label}</label><input id="${name}" name="${name}" type="${type}" value="${esc(p[name] || '')}" ${extra}></div>`;
+  const ta = (name, label, ph = '') =>
+    `<div><label for="${name}">${label}</label><textarea id="${name}" name="${name}" placeholder="${esc(ph)}">${esc(p[name] || '')}</textarea></div>`;
+  app.innerHTML = `
+    <h1>${id ? 'Edit patient' : 'New patient'}</h1>
+    <form id="pf" class="stack">
+      <div class="card"><h2>Details</h2><div class="grid2">
+        ${f('firstName', 'First name *', 'text', 'required autocomplete="off"')}
+        ${f('lastName', 'Last name *', 'text', 'required autocomplete="off"')}
+        ${f('dob', 'Date of birth', 'date')}
+        <div><label for="sex">Sex / gender</label><select id="sex" name="sex">${['', 'Female', 'Male', 'Other / prefer not to say'].map((o) => `<option ${p.sex === o ? 'selected' : ''}>${o}</option>`).join('')}</select></div>
+        ${f('phone', 'Phone', 'tel')}
+        ${f('email', 'Email', 'email')}
+        ${f('occupation', 'Occupation / activities')}
+        ${f('referral', 'Referral source / insurer / file #')}
+      </div></div>
+      <div class="card"><h2>Clinical background</h2><div class="stack">
+        <div class="grid2">${f('condition', 'Primary condition / complaint', 'text', 'placeholder="e.g. Right rotator cuff tendinopathy"')}${f('onsetDate', 'Date of onset / injury', 'date')}</div>
+        ${ta('history', 'Relevant medical & surgical history')}
+        ${ta('medications', 'Medications')}
+        ${ta('precautions', 'Precautions, contraindications & allergies')}
+        ${ta('goals', 'Patient goals', 'e.g. Return to overhead lifting at work; sleep through the night')}
+        <label class="check"><input type="checkbox" name="consent" ${p.consent ? 'checked' : ''}> Consent to assessment/treatment and to record voice notes documented</label>
+      </div></div>
+      <div class="row"><button class="btn primary" type="submit">Save patient</button><a class="btn" href="${id ? '#/patient/' + id : '#/'}">Cancel</a></div>
+    </form>`;
+  $('#pf').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const rec = { ...p, id: p.id || uid(), status: p.status || 'active', createdAt: p.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString() };
+    for (const [k, v] of fd.entries()) rec[k] = String(v).trim();
+    rec.consent = fd.has('consent');
+    await db.put('patients', rec);
+    toast('Patient saved');
+    location.hash = `#/patient/${rec.id}`;
+  });
+}
+
+// ---------- patient detail ----------
+async function patientView(id) {
+  const patient = await db.get('patients', id);
+  if (!patient) return notFound();
+  const visits = sortVisits(await db.byIndex('visits', 'patientId', id));
+  const clipCounts = await Promise.all(visits.map((v) => db.countBy('audio', 'visitId', v.id)));
+  const a = analyze(patient, visits);
+  const settings = getSettings();
+  const delta = (t, lowerBetter) => {
+    if (!t || t.n < 2) return '<span class="d neutral">baseline</span>';
+    const good = lowerBetter ? t.change < 0 : t.change > 0;
+    const cls = t.change === 0 ? 'neutral' : good ? 'good' : 'bad';
+    return `<span class="d ${cls}">${t.change > 0 ? '+' : ''}${t.change} since start (${esc(t.direction)}${t.plateau ? ', plateau' : ''})</span>`;
+  };
+  const tile = (k, v, d) => `<div class="tile"><div class="k">${k}</div><div class="v">${v}</div>${d || ''}</div>`;
+  const nextLabel = visits.length ? '+ Follow-up visit' : '+ Initial assessment';
+  const nextType = visits.length ? 'follow-up' : 'initial';
+
+  app.innerHTML = `
+    <div class="stack">
+    <div class="card">
+      <div class="row between">
+        <div>
+          <h1 style="margin:0">${esc(fullName(patient))} ${patient.status === 'discharged' ? '<span class="badge gray">Discharged</span>' : ''}</h1>
+          <div class="muted">${[age(patient.dob) != null ? age(patient.dob) + ' y' : '', patient.sex, patient.occupation].filter(Boolean).map(esc).join(' · ')}</div>
+          <div class="muted small">${[patient.phone, patient.email].filter(Boolean).map(esc).join(' · ')}</div>
+        </div>
+        <div class="row">
+          <a class="btn primary" href="#/patient/${id}/visit/new/${nextType}">${nextLabel}</a>
+          <a class="btn" href="#/patient/${id}/edit">Edit</a>
+          <button class="btn" id="printBtn">Print</button>
+        </div>
+      </div>
+      <details style="margin-top:.75rem" open>
+        <summary>Clinical background</summary>
+        <dl class="bg">
+          ${[['Condition', patient.condition], ['Onset', patient.onsetDate ? fmtDate(patient.onsetDate) : ''], ['History', patient.history], ['Medications', patient.medications], ['Precautions', patient.precautions], ['Goals', patient.goals], ['Referral', patient.referral]]
+            .filter(([, v]) => v).map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('') || '<dd class="muted">Nothing recorded yet.</dd>'}
+        </dl>
+      </details>
+    </div>
+
+    ${a.alerts.length || a.flags.length ? `<div class="banner ${a.flags.length ? 'danger' : 'warn'}" role="alert"><strong>⚠ Review needed</strong><ul>
+      ${a.alerts.map((t) => `<li>${esc(t)}</li>`).join('')}
+      ${a.flags.map((f) => `<li>Possible red flag: <strong>${esc(f.label)}</strong> — “${esc(f.excerpt)}” <span class="muted">(${fmtDate(f.date)})</span></li>`).join('')}
+    </ul><div class="small">Keyword scan only — confirm clinically.</div></div>` : ''}
+
+    <div class="card">
+      <div class="row between"><h2>Progress</h2><span class="badge ${STATUS_BADGE[a.status]}">${STATUS_LABEL[a.status]}</span></div>
+      ${lineChart([
+        { label: 'Pain (0–10, lower is better)', color: 'var(--pain)', points: series(visits, 'pain') },
+        { label: 'Function (0–10, higher is better)', color: 'var(--func)', points: series(visits, 'function') },
+      ])}
+      <div class="tiles">
+        ${tile('Pain', a.pain ? a.pain.last + '/10' : '–', delta(a.pain, true))}
+        ${tile('Function', a.function ? a.function.last + '/10' : '–', delta(a.function, false))}
+        ${tile('Visits', a.visitCount, `<span class="d neutral">${a.episodeDays} days in episode</span>`)}
+        ${a.measures.map((m) => tile(esc(m.name), `${m.last}${m.unit ? ' <small>' + esc(m.unit) + '</small>' : ''}`, `<span class="d neutral">from ${m.first} · ${esc(m.direction)}</span>`)).join('')}
+      </div>
+    </div>
+
+    <div class="card" id="aiCard">
+      <div class="row between"><h2>✨ AI treatment assistant</h2><span class="badge">${esc(providerLabel(settings.provider))}</span></div>
+      <p class="muted small" style="margin-top:0">Reviews every note, tracks progress and suggests the course of treatment.
+        ${settings.provider === 'local' ? 'Using the built-in offline reviewer. <a href="#/settings">Connect free Gemini or Ollama</a> for a richer narrative review.' : ''}
+        ${isCloud(settings.provider) ? (settings.deidentify ? 'Names, DOB and contact details are removed before sending.' : '<strong class="bad">De-identification is OFF.</strong>') : ''}</p>
+      <div class="row">
+        <button class="btn primary" id="reviewBtn" ${visits.length ? '' : 'disabled'}>Review progress &amp; recommend treatment</button>
+      </div>
+      ${settings.provider !== 'local' ? `<div class="row" style="margin-top:.6rem"><input id="askQ" class="grow" placeholder="Ask about this patient, e.g. “How should I progress loading next visit?”"><button class="btn" id="askBtn" ${visits.length ? '' : 'disabled'}>Ask</button></div>` : ''}
+      <div id="aiOut">${patient.lastReview ? `<div class="ai-out">${mdToHtml(patient.lastReview.text)}<div class="disclaimer">Saved review · ${fmtDateTime(patient.lastReview.at)} · ${esc(providerLabel(patient.lastReview.provider))}</div></div>` : ''}</div>
+      <p class="disclaimer">AI output is decision support only. You remain responsible for clinical decisions and documentation.</p>
+    </div>
+
+    <div class="card">
+      <div class="row between"><h2>Visit history</h2><span class="muted small">${visits.length} total</span></div>
+      ${visits.length ? [...visits].reverse().map((v, i) => visitCard(v, clipCounts[visits.length - 1 - i])).join('') : '<p class="muted">No visits yet.</p>'}
+    </div>
+
+    <div class="card row between">
+      <span class="muted small">Created ${fmtDate(patient.createdAt)}</span>
+      <div class="row">
+        <button class="btn sm" id="dischargeBtn">${patient.status === 'discharged' ? 'Reopen file' : 'Mark discharged'}</button>
+        <button class="btn sm danger" id="delBtn">Delete patient</button>
+      </div>
+    </div></div>`;
+
+  $('#printBtn').onclick = () => window.print();
+  $('#dischargeBtn').onclick = async () => {
+    patient.status = patient.status === 'discharged' ? 'active' : 'discharged';
+    patient.updatedAt = new Date().toISOString();
+    await db.put('patients', patient);
+    route();
+  };
+  $('#delBtn').onclick = async () => {
+    if (!confirm(`Permanently delete ${fullName(patient)} and all ${visits.length} visit(s) and recordings? This cannot be undone.`)) return;
+    await db.deletePatient(id);
+    toast('Patient deleted');
+    location.hash = '#/';
+  };
+
+  const out = $('#aiOut');
+  const runAI = async (question) => {
+    const btns = $$('#aiCard button');
+    btns.forEach((b) => (b.disabled = true));
+    out.innerHTML = '<p class="muted"><span class="spinner"></span> Reviewing notes…</p>';
+    try {
+      const res = await runReview(patient, visits, { question });
+      patient.lastReview = { at: new Date().toISOString(), provider: res.provider, text: res.text };
+      await db.put('patients', patient);
+      out.innerHTML = `<div class="ai-out">${mdToHtml(res.text)}<div class="disclaimer">${fmtDateTime(patient.lastReview.at)} · ${esc(providerLabel(res.provider))}</div></div>`;
+    } catch (e) {
+      out.innerHTML = `<div class="banner danger" role="alert">${esc(e.message)}</div>`;
+    } finally {
+      btns.forEach((b) => (b.disabled = false));
+    }
+  };
+  $('#reviewBtn').onclick = () => runAI('');
+  if ($('#askBtn')) $('#askBtn').onclick = () => { const q = $('#askQ').value.trim(); if (q) runAI(q); };
+}
+
+function visitCard(v, clips) {
+  const body = [['S', v.subjective], ['O', v.objective], ['A', v.assessment], ['P', v.plan], ['Treatment', v.treatment], ['HEP', v.hep]].filter(([, t]) => (t || '').trim());
+  const meas = (v.measures || []).filter((m) => m.name && m.value !== '');
+  return `<div class="visit">
+    <div class="vh"><strong>${fmtDateTime(v.date)}</strong><span class="badge">${esc(VISIT_TYPES[v.type] || v.type)}</span>
+      ${v.status === 'draft' ? '<span class="badge warn">Draft</span>' : ''}
+      ${v.pain != null && v.pain !== '' ? `<span class="badge">Pain ${v.pain}</span>` : ''}${v.function != null && v.function !== '' ? `<span class="badge">Function ${v.function}</span>` : ''}
+      ${clips ? `<span class="badge gray">🎙 ${clips}</span>` : ''}
+      <a class="small" href="#/visit/${v.id}">Open / edit</a></div>
+    <dl>${body.map(([k, t]) => `<dt>${k}</dt><dd>${esc(t)}</dd>`).join('')}
+      ${meas.length ? `<dt>Measures</dt><dd>${meas.map((m) => `${esc(m.name)}: ${esc(m.value)}${m.unit ? ' ' + esc(m.unit) : ''}`).join(' · ')}</dd>` : ''}</dl>
+    ${(v.transcript || '').trim() ? `<details style="margin-top:.4rem"><summary class="small">Transcript</summary><p class="small" style="white-space:pre-wrap">${esc(v.transcript)}</p></details>` : ''}
+  </div>`;
+}
+
+// ---------- visit form (new / follow-up / edit) ----------
+async function visitView(id, pid, requestedType) {
+  let v = id ? await db.get('visits', id) : null;
+  if (id && !v) return notFound();
+  const patient = await db.get('patients', v ? v.patientId : pid);
+  if (!patient) return notFound();
+  const others = sortVisits((await db.byIndex('visits', 'patientId', patient.id)).filter((x) => !v || x.id !== v.id));
+  let existing = !!v;
+  let prev;
+  if (!v) {
+    prev = others[others.length - 1];
+    v = {
+      id: uid(), patientId: patient.id, date: new Date().toISOString(), status: 'draft', createdAt: new Date().toISOString(),
+      type: others.length ? (VISIT_TYPES[requestedType] ? requestedType : 'follow-up') : 'initial',
+      pain: null, function: null, subjective: '', objective: '', assessment: '', plan: '', treatment: '', hep: '', transcript: '',
+      // carry measure names forward so the same tests are repeated and comparable
+      measures: prev ? (prev.measures || []).filter((m) => m.name).map((m) => ({ name: m.name, unit: m.unit, better: m.better, value: '' })) : [],
+    };
+  } else {
+    prev = others.filter((x) => new Date(x.date) < new Date(v.date)).pop();
+  }
+  const settings = getSettings();
+  const ta = (f, label, ph, rows = 4) => `<div><label for="${f}">${label}</label><textarea id="${f}" data-f="${f}" rows="${rows}" placeholder="${esc(ph)}">${esc(v[f])}</textarea></div>`;
+
+  app.innerHTML = `
+    <div class="row between" style="margin-bottom:.75rem">
+      <div><a href="#/patient/${patient.id}" class="small">← ${esc(fullName(patient))}</a>
+        <h1 style="margin:0">${existing ? 'Edit visit' : v.type === 'initial' ? 'Initial assessment' : 'Follow-up visit'}</h1></div>
+      <span id="saveState" class="muted small" aria-live="polite">${existing ? 'Saved' : 'Not saved yet'}</span>
+    </div>
+    <form id="vf" class="stack" onsubmit="return false">
+      ${prev ? `<div class="prev"><div><b>Last visit · ${fmtDate(prev.date)}</b> ${prev.pain != null && prev.pain !== '' ? ` · pain ${prev.pain}` : ''}${prev.function != null && prev.function !== '' ? ` · function ${prev.function}` : ''}</div>
+        ${prev.assessment ? `<p><b>Assessment:</b> ${esc(prev.assessment)}</p>` : ''}${prev.plan ? `<p><b>Plan:</b> ${esc(prev.plan)}</p>` : ''}${prev.hep ? `<p><b>HEP:</b> ${esc(prev.hep)}</p>` : ''}
+        ${patient.goals ? `<p><b>Goals:</b> ${esc(patient.goals)}</p>` : ''}</div>` : (patient.goals ? `<div class="prev"><b>Patient goals:</b> ${esc(patient.goals)}</div>` : '')}
+
+      <div class="card"><div class="grid2">
+        <div><label for="date">Date &amp; time</label><input id="date" type="datetime-local" data-f="date" value="${toLocalInput(v.date)}"></div>
+        <div><label for="type">Visit type</label><select id="type" data-f="type">${Object.entries(VISIT_TYPES).map(([k, n]) => `<option value="${k}" ${v.type === k ? 'selected' : ''}>${n}</option>`).join('')}</select></div>
+        <div><label for="pain">Pain now (0–10)</label><input id="pain" type="number" inputmode="decimal" min="0" max="10" step="0.5" data-f="pain" value="${v.pain ?? ''}" placeholder="NPRS"></div>
+        <div><label for="function">Function (0–10, 10 = fully able)</label><input id="function" type="number" inputmode="decimal" min="0" max="10" step="0.1" data-f="function" value="${v.function ?? ''}" placeholder="e.g. PSFS average"></div>
+      </div></div>
+
+      <div class="card"><h2>🎙 Voice notes</h2>
+        <div class="rec-box">
+          <div class="row"><button type="button" class="btn rec" id="recBtn">● Start recording</button>
+            <span id="recLive" class="rec-live" hidden><i></i><span id="recTime">0:00</span></span></div>
+          <div class="interim" id="interim" aria-live="off"></div>
+          <div id="clips"></div>
+          <p class="small muted" style="margin-bottom:0">${!recordingSupported ? '⚠ Audio recording is not supported in this browser. ' : ''}${speechSupported ? 'Live transcription is on while recording (language: ' + esc(settings.speechLang) + ').' : 'Live transcription isn’t available in this browser; recordings are still saved. Use “Transcribe with AI” (Gemini) or type below.'}</p>
+        </div>
+        <div style="margin-top:.75rem"><label for="transcript">Transcript (editable)</label>
+          <textarea id="transcript" data-f="transcript" rows="6" placeholder="Transcripts of your recordings appear here. You can also type or use your keyboard’s dictation.">${esc(v.transcript)}</textarea></div>
+        <div class="row" style="margin-top:.5rem"><button type="button" class="btn sm" id="soapBtn">✨ Structure transcript into SOAP</button><span class="muted small" id="soapMsg"></span></div>
+      </div>
+
+      <div class="card"><h2>Clinical note</h2><div class="stack">
+        ${ta('subjective', 'Subjective — history, symptoms, patient report', 'Since last visit… aggravating / easing factors, sleep, function, adherence to HEP')}
+        ${ta('objective', 'Objective — observation, ROM, strength, special tests', 'Findings today')}
+        ${ta('assessment', 'Assessment — clinical impression, response to treatment', 'Progress vs. last visit and goals')}
+        ${ta('plan', 'Plan — next steps, frequency, referrals', 'Plan / next visit')}
+        ${ta('treatment', 'Treatment provided today', 'Manual therapy, exercises, education…', 3)}
+        ${ta('hep', 'Home exercise programme / advice', 'Exercises, sets × reps, frequency', 3)}
+      </div></div>
+
+      <div class="card"><h2>Outcome measures</h2>
+        <p class="muted small" style="margin-top:0">ROM, strength, functional tests, questionnaire scores — tracked across visits. Names carry forward to the next visit.</p>
+        <div id="measures"></div>
+        <button type="button" class="btn sm" id="addMeasure">+ Add measure</button>
+      </div>
+
+      <div class="savebar">
+        <button type="button" class="btn primary" id="finishBtn">Save &amp; finish</button>
+        <button type="button" class="btn" id="draftBtn">Save draft &amp; exit</button>
+        <span class="grow"></span>
+        <button type="button" class="btn danger sm" id="delVisit">${existing ? 'Delete visit' : 'Discard'}</button>
+      </div>
+    </form>`;
+
+  // --- saving ---
+  const state = $('#saveState');
+  let discarded = false;
+  const save = async () => {
+    if (discarded) return;
+    v.updatedAt = new Date().toISOString();
+    await db.put('visits', v);
+    existing = true;
+    state.textContent = 'Saved ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  };
+  const autosave = debounce(() => save().catch((e) => toast('Autosave failed: ' + e.message, true)), 1000);
+  onLeave(() => autosave.flush());
+  const touch = () => { state.textContent = 'Saving…'; autosave(); };
+
+  $('#vf').addEventListener('input', (e) => {
+    const f = e.target.dataset.f;
+    if (f) {
+      if (f === 'date') v.date = fromLocalInput(e.target.value);
+      else if (f === 'pain' || f === 'function') v[f] = e.target.value === '' ? null : Math.min(10, Math.max(0, parseFloat(e.target.value)));
+      else v[f] = e.target.value;
+      touch();
+    } else if (e.target.dataset.mi !== undefined) {
+      v.measures[+e.target.dataset.mi][e.target.dataset.mk] = e.target.value;
+      touch();
+    }
+  });
+  $('#vf').addEventListener('change', (e) => {
+    if (e.target.dataset.mi !== undefined && e.target.dataset.mk === 'better') { v.measures[+e.target.dataset.mi].better = e.target.value; touch(); }
+  });
+
+  // --- measures ---
+  const drawMeasures = () => {
+    $('#measures').innerHTML = v.measures.map((m, i) => `<div class="mrow">
+      <input data-mi="${i}" data-mk="name" value="${esc(m.name)}" placeholder="e.g. Shoulder flexion ROM" aria-label="Measure name">
+      <input data-mi="${i}" data-mk="value" value="${esc(m.value)}" inputmode="decimal" placeholder="Value" aria-label="Value">
+      <input data-mi="${i}" data-mk="unit" value="${esc(m.unit || '')}" placeholder="Unit (°, kg, s)" aria-label="Unit">
+      <select data-mi="${i}" data-mk="better" aria-label="Which direction is better"><option value="up" ${m.better !== 'down' ? 'selected' : ''}>Higher = better</option><option value="down" ${m.better === 'down' ? 'selected' : ''}>Lower = better</option></select>
+      <button type="button" class="btn sm" data-rm="${i}" aria-label="Remove measure">✕</button></div>`).join('') || '<p class="muted small">None yet.</p>';
+    $$('[data-rm]', $('#measures')).forEach((b) => (b.onclick = () => { v.measures.splice(+b.dataset.rm, 1); drawMeasures(); touch(); }));
+  };
+  $('#addMeasure').onclick = () => { v.measures.push({ name: '', value: '', unit: '', better: 'up' }); drawMeasures(); touch(); $$('[data-mk=name]').pop()?.focus(); };
+  drawMeasures();
+
+  // --- transcript helpers ---
+  const appendTranscript = (text) => {
+    if (!text) return;
+    const t = $('#transcript');
+    const stamp = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    t.value = (t.value.trim() ? t.value.trimEnd() + '\n\n' : '') + `[${stamp}] ${text}`;
+    v.transcript = t.value;
+    touch();
+  };
+
+  // --- audio clips ---
+  let urls = [];
+  onLeave(() => urls.forEach(URL.revokeObjectURL));
+  const drawClips = async () => {
+    urls.forEach(URL.revokeObjectURL);
+    urls = [];
+    const clips = existing ? (await db.byIndex('audio', 'visitId', v.id)).sort((a, b) => a.createdAt.localeCompare(b.createdAt)) : [];
+    $('#clips').innerHTML = clips.map((c, i) => {
+      const url = URL.createObjectURL(c.blob);
+      urls.push(url);
+      return `<div class="clip"><div class="row between"><span class="small"><strong>Recording ${i + 1}</strong> · ${fmtDateTime(c.createdAt)} · ${fmtDur(c.durationSec || 0)}</span>
+        <span class="row"><button type="button" class="btn sm" data-tr="${c.id}">Transcribe with AI</button><button type="button" class="btn sm danger" data-dc="${c.id}">Delete</button></span></div>
+        <audio controls preload="metadata" src="${url}"></audio></div>`;
+    }).join('');
+    $$('[data-dc]').forEach((b) => (b.onclick = async () => {
+      if (!confirm('Delete this recording? The transcript text stays in the note.')) return;
+      await db.del('audio', b.dataset.dc);
+      drawClips();
+    }));
+    $$('[data-tr]').forEach((b) => (b.onclick = async () => {
+      const clip = clips.find((c) => c.id === b.dataset.tr);
+      b.disabled = true; b.innerHTML = '<span class="spinner"></span> Transcribing…';
+      try {
+        const text = await transcribeAudio(clip.blob);
+        clip.transcript = text;
+        await db.put('audio', clip);
+        appendTranscript(text || '(no speech detected)');
+        toast('Transcript added');
+      } catch (e) { toast(e.message, true); }
+      b.disabled = false; b.textContent = 'Transcribe with AI';
+    }));
+  };
+  drawClips();
+
+  // --- recording ---
+  let recorder = null;
+  const stopRecording = async () => {
+    const r = recorder;
+    recorder = null;
+    $('#recBtn').textContent = '● Start recording';
+    $('#recLive').hidden = true;
+    $('#interim').textContent = '';
+    const res = await r.stop();
+    await save(); // make sure the visit exists before attaching audio
+    await db.put('audio', { id: uid(), visitId: v.id, blob: res.blob, mime: res.mime, durationSec: res.durationSec, createdAt: new Date().toISOString(), transcript: res.transcript });
+    if (res.transcript) appendTranscript(res.transcript);
+    else toast('Recording saved. No live transcript was captured — use “Transcribe with AI” or type notes.');
+    if (app.contains($('#clips'))) drawClips();
+  };
+  onLeave(async () => { if (recorder) await stopRecording(); });
+  $('#recBtn').onclick = async () => {
+    if (recorder) return stopRecording().catch((e) => toast(e.message, true));
+    if (!recordingSupported) return toast('This browser cannot record audio. Try Chrome, Edge or Safari over HTTPS.', true);
+    const r = new Recorder({
+      lang: settings.speechLang,
+      onTick: (s) => ($('#recTime').textContent = fmtDur(s)),
+      onInterim: (t) => ($('#interim').textContent = (r.finalText ? r.finalText + ' ' : '') + t),
+      onFinal: () => ($('#interim').textContent = r.finalText),
+      onSpeechError: (err) => toast(`Live transcription issue (${err}). Audio is still being recorded.`, true),
+    });
+    try { await r.start(); } catch (e) {
+      return toast(e.name === 'NotAllowedError' ? 'Microphone permission denied. Allow it in your browser settings.' : 'Could not start recording: ' + e.message, true);
+    }
+    recorder = r;
+    $('#recBtn').textContent = '■ Stop & save';
+    $('#recLive').hidden = false;
+  };
+  const warnUnload = (e) => { if (recorder) { e.preventDefault(); e.returnValue = ''; } };
+  window.addEventListener('beforeunload', warnUnload);
+  onLeave(() => window.removeEventListener('beforeunload', warnUnload));
+
+  // --- AI: dictation -> SOAP ---
+  $('#soapBtn').onclick = async () => {
+    const text = $('#transcript').value.trim();
+    if (!text) return toast('Record or type some notes first.', true);
+    const btn = $('#soapBtn');
+    btn.disabled = true; $('#soapMsg').innerHTML = '<span class="spinner"></span> Structuring…';
+    try {
+      const res = await runSoap(patient, text);
+      let filled = 0;
+      for (const [k, val] of Object.entries(res)) {
+        if (val && !(v[k] || '').trim()) { v[k] = val; $('#' + k).value = val; filled++; }
+      }
+      $('#soapMsg').textContent = filled ? `Filled ${filled} empty field(s) — please review.` : 'No empty fields to fill (existing text kept).';
+      touch();
+    } catch (e) { $('#soapMsg').textContent = ''; toast(e.message, true); }
+    btn.disabled = false;
+  };
+
+  // --- finish / discard ---
+  const leaveToPatient = () => (location.hash = `#/patient/${patient.id}`);
+  $('#finishBtn').onclick = async () => {
+    if (recorder) await stopRecording();
+    v.status = 'final';
+    await save();
+    toast('Visit saved');
+    leaveToPatient();
+  };
+  $('#draftBtn').onclick = async () => { if (recorder) await stopRecording(); await save(); leaveToPatient(); };
+  $('#delVisit').onclick = async () => {
+    if (!confirm(existing ? 'Delete this visit and its recordings permanently?' : 'Discard this visit?')) return;
+    discarded = true;
+    if (recorder) { try { await recorder.stop(); } catch { /* ignore */ } recorder = null; }
+    if (existing) await db.deleteVisit(v.id);
+    leaveToPatient();
+  };
+}
+
+// ---------- settings ----------
+async function settingsView() {
+  const s = getSettings();
+  const est = navigator.storage?.estimate ? await navigator.storage.estimate().catch(() => null) : null;
+  const radio = (val, title, desc) => `<label class="check" style="align-items:flex-start;margin-bottom:.5rem"><input type="radio" name="provider" value="${val}" ${s.provider === val ? 'checked' : ''}><span><strong>${title}</strong><br><span class="muted small">${desc}</span></span></label>`;
+  app.innerHTML = `
+    <h1>Settings</h1>
+    <div class="stack">
+    <div class="card"><h2>AI assistant (free options)</h2>
+      ${radio('local', 'Built-in offline reviewer', 'Free, instant, fully private. Tracks pain/function/measure trends, plateaus, red-flag keywords and gives rule-based treatment suggestions. No account needed.')}
+      ${radio('gemini', 'Google Gemini (free tier)', 'Richer narrative review, treatment suggestions, dictation → SOAP, and audio transcription. Needs your own free API key from Google AI Studio. Data is sent to Google.')}
+      ${radio('ollama', 'Ollama (local model)', 'Free and private: runs an open-source model on your own computer (install from ollama.com, then <code>ollama pull llama3.1</code>). Start Ollama with <code>OLLAMA_ORIGINS=*</code> so the browser may call it.')}
+      <div id="geminiBox" class="stack" hidden style="margin-top:.75rem">
+        <div class="warnbox"><strong>Privacy:</strong> Gemini’s free tier is a consumer-grade service — Google’s terms allow free-tier inputs to be used to improve its products, and it is not a health-information custodian agreement. Only use it with patient consent and keep de-identification on, or use the offline / Ollama options. Check your regulator’s and privacy-law requirements (e.g. PHIPA / PIPEDA / provincial rules).</div>
+        <div class="grid2"><div><label for="gkey">Gemini API key</label><input id="gkey" type="password" autocomplete="off" value="${esc(s.geminiKey)}" placeholder="Paste key from aistudio.google.com/apikey"></div>
+        <div><label for="gmodel">Model</label><input id="gmodel" value="${esc(s.geminiModel)}"></div></div>
+        <p class="muted small" style="margin:0">The key is stored only in this browser. Create one free at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>.</p>
+      </div>
+      <div id="ollamaBox" class="grid2" hidden style="margin-top:.75rem">
+        <div><label for="ourl">Ollama URL</label><input id="ourl" value="${esc(s.ollamaUrl)}"></div>
+        <div><label for="omodel">Model</label><input id="omodel" value="${esc(s.ollamaModel)}"></div>
+      </div>
+      <label class="check" style="margin-top:.75rem"><input type="checkbox" id="deid" ${s.deidentify ? 'checked' : ''}> De-identify notes before sending to an AI model (removes names, emails, phone numbers, postal codes; sends age instead of DOB)</label>
+      <div class="row" style="margin-top:.75rem"><button class="btn primary" id="saveAI">Save</button><button class="btn" id="testAI">Test connection</button><span id="aiMsg" class="small muted"></span></div>
+    </div>
+
+    <div class="card"><h2>Voice</h2>
+      <label for="lang">Dictation language</label>
+      <select id="lang" style="max-width:260px">${[['en-CA', 'English (Canada)'], ['en-US', 'English (US)'], ['en-GB', 'English (UK)'], ['fr-CA', 'Français (Canada)'], ['es-US', 'Español']].map(([c, n]) => `<option value="${c}" ${s.speechLang === c ? 'selected' : ''}>${n}</option>`).join('')}</select>
+      <p class="muted small">Live transcription uses your browser’s speech recognition (Chrome/Edge send audio to their speech service; Safari may too). For maximum privacy, record audio only and transcribe with a local method, or type notes.</p>
+    </div>
+
+    <div class="card"><h2>Backup &amp; data</h2>
+      <p class="muted small" style="margin-top:0">All data is stored <strong>only on this device</strong> (in the browser). Clearing browser data or losing the device loses it — export backups regularly and store them encrypted.${est ? ` Using ${(est.usage / 1048576).toFixed(1)} MB.` : ''}</p>
+      <div class="row">
+        <button class="btn" id="expNo">Export backup (no audio)</button>
+        <button class="btn" id="expYes">Export backup with audio</button>
+        <label class="btn" for="impFile" style="margin:0;color:var(--text)">Import backup…</label><input type="file" id="impFile" accept="application/json" hidden>
+        <button class="btn" id="persist">Protect storage from auto-clearing</button>
+        <button class="btn danger" id="wipe">Delete all data</button>
+      </div><span id="dataMsg" class="small muted"></span>
+    </div></div>`;
+
+  const showBoxes = () => {
+    const p = $('input[name=provider]:checked').value;
+    $('#geminiBox').hidden = p !== 'gemini';
+    $('#ollamaBox').hidden = p !== 'ollama';
+  };
+  $$('input[name=provider]').forEach((r) => r.addEventListener('change', () => {
+    showBoxes();
+    if (r.value === 'gemini' && r.checked) alert('Reminder: Gemini’s free tier sends data to Google and may use it to improve its products. Use only with patient consent, keep de-identification on, and prefer the offline or Ollama option for identifiable details.');
+  }));
+  showBoxes();
+  const collect = () => ({
+    ...getSettings(),
+    provider: $('input[name=provider]:checked').value,
+    geminiKey: $('#gkey').value.trim(), geminiModel: $('#gmodel').value.trim() || 'gemini-flash-latest',
+    ollamaUrl: $('#ourl').value.trim() || 'http://localhost:11434', ollamaModel: $('#omodel').value.trim() || 'llama3.1',
+    deidentify: $('#deid').checked, speechLang: $('#lang').value,
+  });
+  $('#lang').onchange = () => saveSettings(collect());
+  $('#saveAI').onclick = () => { saveSettings(collect()); $('#aiMsg').textContent = 'Saved.'; toast('Settings saved'); };
+  $('#testAI').onclick = async () => {
+    saveSettings(collect());
+    $('#aiMsg').innerHTML = '<span class="spinner"></span> Testing…';
+    try { $('#aiMsg').textContent = await testConnection(); } catch (e) { $('#aiMsg').textContent = '✗ ' + e.message; }
+  };
+
+  const exportAll = async (withAudio) => {
+    const [patients, visits, audioRows] = await Promise.all([db.getAll('patients'), db.getAll('visits'), db.getAll('audio')]);
+    const audio = withAudio ? await Promise.all(audioRows.map(async ({ blob, ...a }) => ({ ...a, data: await blobToBase64(blob) }))) : [];
+    const blob = new Blob([JSON.stringify({ app: 'physio-notes', version: 1, exportedAt: new Date().toISOString(), patients, visits, audio })], { type: 'application/json' });
+    download(`physio-notes-backup-${new Date().toISOString().slice(0, 10)}${withAudio ? '-audio' : ''}.json`, blob);
+    $('#dataMsg').textContent = `Exported ${patients.length} patients, ${visits.length} visits${withAudio ? `, ${audio.length} recordings` : ''}.`;
+  };
+  $('#expNo').onclick = () => exportAll(false);
+  $('#expYes').onclick = () => exportAll(true);
+  $('#impFile').onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const d = JSON.parse(await file.text());
+      if (d.app !== 'physio-notes') throw new Error('Not a PhysioNotes backup file.');
+      if (!confirm(`Import ${d.patients?.length || 0} patients and ${d.visits?.length || 0} visits? Records with the same ID will be overwritten.`)) return;
+      for (const p of d.patients || []) await db.put('patients', p);
+      for (const x of d.visits || []) await db.put('visits', x);
+      for (const { data, ...a } of d.audio || []) await db.put('audio', { ...a, blob: base64ToBlob(data, a.mime) });
+      $('#dataMsg').textContent = 'Import complete.';
+    } catch (err) { toast('Import failed: ' + err.message, true); }
+    e.target.value = '';
+  };
+  $('#persist').onclick = async () => {
+    const ok = navigator.storage?.persist ? await navigator.storage.persist() : false;
+    toast(ok ? 'Storage protected from automatic clearing.' : 'Browser declined (installing the app to your home screen may help).', !ok);
+  };
+  $('#wipe').onclick = async () => {
+    if (prompt('This permanently deletes ALL patients, notes and recordings on this device. Type DELETE to confirm.') !== 'DELETE') return;
+    await db.clearAll();
+    toast('All data deleted');
+    location.hash = '#/';
+  };
+}
+
+// ---------- boot ----------
+if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
+navigator.storage?.persist?.().catch(() => {});
+route();
