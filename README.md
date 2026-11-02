@@ -24,24 +24,38 @@ A private, local-first notes app for physiotherapists. Installable as a PWA (pho
 
 PhysioNotes is a static website. It must be *served* (opening `index.html` by double-click does not work because browsers block modules and the microphone on `file://`).
 
-**Windows:** unzip the folder and double-click **`start.bat`** — it opens http://localhost:8080 (uses Node or Python if installed, otherwise built-in PowerShell; nothing to install).
-**Mac/Linux:** double-click/run `start.command`, or `node serve.mjs` / `python3 -m http.server 8080`.
-**On your phone / anywhere (recommended):** host it over HTTPS — a GitHub Pages workflow is included (`.github/workflows/pages.yml`). In the repo: *Settings → Pages → Source: GitHub Actions*, merge to `main`, and open the published link. Then use *Add to Home Screen* to install it. (Note: each device/browser keeps its own separate data.)
+**Quick local try-out (Windows):** unzip the folder and double-click **`start.bat`** — opens http://localhost:8080 (uses Node or Python if installed, otherwise built-in PowerShell). Mac/Linux: `start.command`, or `node serve.mjs`.
 
-`npm test` runs the unit tests (analysis engine, accounts and encryption).
+**For real use on your phone *and* laptop, put it online over HTTPS** (needed for the microphone and Dropbox sign-in on a phone). The app contains no patient data or secrets, so any free static host works:
 
-## Set up the free Gemini AI
+- **Netlify Drop (easiest):** run `npm run build` (or just use the files in `site/`), then drag the **`site`** folder onto <https://app.netlify.com/drop>. You get an `https://…netlify.app` address immediately.
+- **Cloudflare Pages / GitHub Pages:** a Pages workflow is included (`.github/workflows/pages.yml`; repo *Settings → Pages → Source: GitHub Actions*, merge to `main`). GitHub Pages needs a public repo on free plans — fine, since the code holds no data.
 
-1. Open <https://aistudio.google.com/apikey> and sign in with a Google account.
-2. *Create API key* (free tier, no payment details) and copy it.
-3. In PhysioNotes → **Settings**, paste it and press **Save & test**.
+Open that address on each device and use *Add to Home Screen* to install it.
+
+`npm test` runs the unit tests (analysis engine, accounts, encryption). Sync is covered by a two-device browser test against a mock Dropbox (`tests/e2e/`, needs Playwright).
+
+## Sync between your phone and laptop (Dropbox, end-to-end encrypted)
+
+Everything is encrypted on your device *before* it is uploaded to a private app folder in **your own Dropbox**; Dropbox only ever stores unreadable files. There is no PhysioNotes server. Each colleague uses their own Dropbox, so accounts stay separate.
+
+**One-time setup (≈5 min), on the first device** — Settings → *Sync across devices* shows these steps with your exact redirect address:
+1. <https://www.dropbox.com/developers/apps> → *Create app* → *Scoped access* → *App folder* → name it.
+2. *Permissions* tab: tick `files.metadata.read/write` and `files.content.read/write` → Submit.
+3. *Settings* tab: add your app's address (e.g. `https://yourname.netlify.app/`) under *Redirect URIs*; copy the **App key**.
+4. In PhysioNotes: paste the App key → *Connect Dropbox* → approve → sign in. Existing notes upload automatically.
+
+**On your second device:** open the same web address → *Set up from Dropbox* → same App key → pick your account → sign in with your usual password. Your patients, notes and recordings download and decrypt locally.
+
+How it behaves: works fully offline and syncs in the background when online (header shows ☁ Synced / ⟳ Syncing / Offline). Signing out or auto-locking pushes your last edits first. If the **same visit is edited on two devices**, nothing is lost: the newer version stays and the other is kept as a **"Conflict copy"** for you to review. Deleting a patient/visit on one device removes it on the others. Voice recordings sync too (each recording up to ~13 MB).
 
 ## Accounts & security model
 
 - **How isolation works.** Passwords never leave the device and are never stored. A random 256-bit data key encrypts every record; that key is itself wrapped by a key derived from your password (PBKDF2-SHA-256, 600 000 iterations) and, separately, by your one-time **recovery key**. Each account uses a separate IndexedDB database, and each record's ciphertext is bound to its own ID so it can't be swapped between records. Without the password or recovery key, the stored bytes are unreadable — even to another user of the same browser or someone copying the browser profile. The unlocked key is held in memory only (non-extractable) and dropped on lock.
 - **No password reset by anyone else.** There is no server or admin. If a user loses both password and recovery key, their data cannot be recovered (by design).
-- **Same device vs. different devices.** Colleagues can share one computer, each with their own login, with no visibility into each other's patients. On separate devices each person simply has their own copy. There is **no automatic sync between devices or users** — to move data use *Export encrypted backup → Import*. A central, multi-device clinic server would be a different architecture (hosted database, server-side auth, audit logging, a privacy impact assessment).
-- **Hardening.** Strict Content-Security-Policy (no inline scripts; network access only to Google's Gemini endpoint and localhost for Ollama), no third-party scripts, no analytics, `no-referrer`.
+- **Same device vs. different devices.** Colleagues can share one computer, each with their own login, with no visibility into each other's patients. To use one account on several devices, turn on Dropbox sync (above): every device has the same data key, unlocked by the same password. Sync is **per person** — there is no shared patient list between colleagues. A central clinic server (shared caseloads, audit logs, admin) would be a different architecture.
+- **What Dropbox (or anyone with your Dropbox) can see.** Only ciphertext, random record IDs, file sizes and timing — no names, notes or audio. They also hold your account file (username, display name and your data key *wrapped by your password*), so a **strong password matters**: someone with your Dropbox could try to guess it offline (PBKDF2 slows this down). Don't share the Dropbox folder, and disconnect + delete the cloud copy from Settings when leaving the clinic. Token for Dropbox is kept encrypted on each device.
+- **Hardening.** Strict Content-Security-Policy (no inline scripts; network access only to Google's Google Gemini, Dropbox, and localhost for Ollama), no third-party scripts, no analytics, `no-referrer`.
 - **What encryption does *not* cover.** Text sent to Gemini and audio sent to the browser's speech service leave the device by design (de-identification is on by default). Malware or a hostile browser extension on an unlocked device can read what's on screen. Usernames and display names are visible on the sign-in screen. Use a device passcode/disk encryption too.
 
 ## Privacy & compliance — please read
@@ -59,5 +73,6 @@ js/ai.js        providers (offline, Gemini, Ollama), de-identification, prompts
 js/voice.js     recorder + live speech recognition + WAV conversion
 js/crypto.js    Web Crypto helpers (key wrap, AES-GCM, recovery key, backups)
 js/auth.js      accounts: sign-up, login, recovery, password change
+js/dropbox.js   Dropbox OAuth (PKCE) + file API     js/sync.js  encrypted sync engine & conflict handling
 js/db.js        per-user encrypted IndexedDB     js/charts.js  SVG charts     js/app.js  UI/router
 ```

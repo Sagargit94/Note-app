@@ -85,3 +85,22 @@ test('removing an account needs the password', async () => {
   await Auth.removeAccount('ian', PW);
   assert.equal(Auth.listAccounts().length, 0);
 });
+
+test('account can be exported and imported on another device (same data key)', async () => {
+  const s = await Auth.signUp({ username: 'joan', displayName: 'Jo', password: PW });
+  const box = await C.encryptJson(s.key, { x: 'secret' }, 'patients:z');
+  const blob = JSON.parse(JSON.stringify(Auth.publicAccount('joan')));
+  mem.clear(); // "new device"
+  Auth.importAccount(blob);
+  const again = await Auth.logIn('joan', PW);
+  assert.deepEqual(await C.decryptJson(again.key, box, 'patients:z'), { x: 'secret' });
+  assert.ok(!JSON.stringify(blob).includes(PW));
+  assert.throws(() => Auth.importAccount({ id: 'x', username: 'joan' }), /damaged/);
+});
+
+test('wire format round-trips ciphertext rows', async () => {
+  const s = await Auth.signUp({ username: 'kim', password: PW });
+  const box = await C.encryptJson(s.key, { a: 1 }, 'visits:1');
+  const row = C.wireToRow(JSON.parse(JSON.stringify(C.rowToWire({ id: '1', ...box }))));
+  assert.deepEqual(await C.decryptJson(s.key, row, 'visits:1'), { a: 1 });
+});

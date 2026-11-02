@@ -4,10 +4,12 @@
 import * as C from './crypto.js';
 import { dbNameFor } from './auth.js';
 
-const VERSION = 1;
+const VERSION = 2;
 let dbp = null;
 let key = null;
 let dbName = null;
+let tracking = false;      // when sync is enabled, local writes are recorded as dirty
+let changeHook = null;
 
 export function openUser(userId, sessionKey) {
   lock();
@@ -17,10 +19,12 @@ export function openUser(userId, sessionKey) {
     const req = indexedDB.open(dbName, VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
-      db.createObjectStore('patients', { keyPath: 'id' });
-      db.createObjectStore('visits', { keyPath: 'id' }).createIndex('patientId', 'patientId');
-      db.createObjectStore('audio', { keyPath: 'id' }).createIndex('visitId', 'visitId');
-      db.createObjectStore('settings', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('patients')) db.createObjectStore('patients', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('visits')) db.createObjectStore('visits', { keyPath: 'id' }).createIndex('patientId', 'patientId');
+      if (!db.objectStoreNames.contains('audio')) db.createObjectStore('audio', { keyPath: 'id' }).createIndex('visitId', 'visitId');
+      if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings', { keyPath: 'id' });
+      // v2: local-only sync bookkeeping (record ids + revisions; no patient content)
+      if (!db.objectStoreNames.contains('syncmeta')) db.createObjectStore('syncmeta', { keyPath: 'id' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -29,6 +33,7 @@ export function openUser(userId, sessionKey) {
 }
 
 export function lock() {
+  tracking = false;
   dbp?.then((d) => d.close()).catch(() => {});
   dbp = null;
   key = null;
@@ -73,10 +78,64 @@ const openAll = (name, rows) => Promise.all(rows.map((r) => open(name, r)));
 
 export const getAll = async (name) => openAll(name, await wrap((await store(name)).getAll()));
 export const get = async (name, id) => open(name, await wrap((await store(name)).get(id)));
-export const put = async (name, obj) => { const row = await seal(name, obj); return wrap((await store(name, 'readwrite')).put(row)); };
-export const del = async (name, id) => wrap((await store(name, 'readwrite')).delete(id));
+export const put = async (name, obj) => {
+  const row = await seal(name, obj);
+  const r = await wrap((await store(name, 'readwrite')).put(row));
+  await markDirty(name, obj.id, false);
+  return r;
+};
+export const del = async (name, id) => {
+  const r = await wrap((await store(name, 'readwrite')).delete(id));
+  await markDirty(name, id, true);
+  return r;
+};
 export const byIndex = async (name, index, value) => openAll(name, await wrap((await store(name)).index(index).getAll(value)));
 export const countBy = async (name, index, value) => wrap((await store(name)).index(index).count(value));
+
+// ---- sync support -------------------------------------------------------------------------------
+const PREFIX = { patients: 'p', visits: 'v', audio: 'a', settings: 's' };
+export const SYNC_KINDS = PREFIX;
+export const syncable = (name, id) => name in PREFIX && (name !== 'settings' || id === 'main');
+export const metaKey = (name, id) => `${PREFIX[name]}:${id}`;
+export function setTracking(on, hook) { tracking = on; changeHook = hook || null; }
+
+export const metaGet = async (key) => wrap((await store('syncmeta')).get(key));
+export const metaPut = async (m) => wrap((await store('syncmeta', 'readwrite')).put(m));
+export const metaDel = async (key) => wrap((await store('syncmeta', 'readwrite')).delete(key));
+export const metaAll = async () => wrap((await store('syncmeta')).getAll());
+
+async function markDirty(name, id, deleted) {
+  if (!tracking || !syncable(name, id)) return;
+  const key = metaKey(name, id);
+  const old = await metaGet(key);
+  await metaPut({ id: key, store: name, rid: id, rev: old?.rev ?? null, dirty: true, deleted, v: (old?.v || 0) + 1 });
+  changeHook?.();
+}
+// Marks every existing record dirty (used when sync is switched on for an account that already has data).
+export async function seedDirty() {
+  for (const name of ['patients', 'visits', 'audio']) {
+    const keys = await wrap((await store(name)).getAllKeys());
+    for (const id of keys) if (!(await metaGet(metaKey(name, id)))) await metaPut({ id: metaKey(name, id), store: name, rid: id, rev: null, dirty: true, deleted: false, v: 1 });
+  }
+  if (await wrap((await store('settings')).get('main'))) {
+    const k = metaKey('settings', 'main');
+    if (!(await metaGet(k))) await metaPut({ id: k, store: 'settings', rid: 'main', rev: null, dirty: true, deleted: false, v: 1 });
+  }
+}
+export async function clearSyncMeta() { await wrap((await store('syncmeta', 'readwrite')).clear()); }
+
+export const rawRow = async (name, id) => wrap((await store(name)).get(id));
+// Stores a ciphertext row received from sync WITHOUT marking it dirty. Decrypts first (verifies AAD + key).
+export async function importRow(name, row) {
+  const obj = await open(name, row);
+  const clean = { ...row };
+  if (name === 'visits') clean.patientId = obj.patientId;
+  if (name === 'audio') clean.visitId = obj.visitId;
+  await wrap((await store(name, 'readwrite')).put(clean));
+  return obj;
+}
+export const decryptRow = (name, row) => open(name, row);
+export const deleteSilently = async (name, id) => wrap((await store(name, 'readwrite')).delete(id));
 
 export async function deletePatient(id) {
   for (const v of await byIndex('visits', 'patientId', id)) await deleteVisit(v.id);
@@ -89,7 +148,9 @@ export async function deleteVisit(id) {
 }
 // Removes all patient data but keeps settings and the account.
 export async function clearPatientData() {
-  for (const n of ['patients', 'visits', 'audio']) await wrap((await store(n, 'readwrite')).clear());
+  for (const n of ['patients', 'visits', 'audio']) {
+    for (const id of await wrap((await store(n)).getAllKeys())) await del(n, id); // records tombstones when syncing
+  }
 }
 
 // ---- legacy (pre-accounts) plaintext database, so earlier notes can be claimed into an account ----

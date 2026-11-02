@@ -175,3 +175,6 @@ details > summary { cursor: pointer; font-weight: 650; }
 dialog.modal { border: 0; border-radius: var(--radius); padding: 1.3rem; width: min(440px, 92vw); background: var(--card); color: var(--text); box-shadow: 0 24px 60px rgba(0,0,0,.35); }
 dialog.modal::backdrop { background: rgba(8,20,24,.55); backdrop-filter: blur(3px); }
 @media print { .reckey { border-color: #000; } .auth .row, .auth label, .auth .btn, .auth .disclaimer { display: none !important; } }
+
+.syncchip { color: #fff !important; font-size: .8rem; opacity: .95; } .syncchip.bad { background: rgba(220,38,38,.5); }
+code { background: var(--soft); padding: .05rem .35rem; border-radius: 6px; font-size: .85em; word-break: break-all; }

@@ -1,5 +1,7 @@
 import * as db from './db.js';
 import * as auth from './auth.js';
+import * as sync from './sync.js';
+import { beginAuth, takeAuthReturn, exchangeCode, redirectUri } from './dropbox.js';
 import { encryptWithPassphrase, decryptWithPassphrase } from './crypto.js';
 import { esc, uid, fmtDate, fmtDateTime, fmtDur, age, debounce, toLocalInput, fromLocalInput, mdToHtml, download, blobToBase64, base64ToBlob } from './util.js';
 import { analyze, sortVisits, series, STATUS_LABEL } from './analysis.js';
@@ -322,7 +324,7 @@ function visitCard(v, clips) {
   const meas = (v.measures || []).filter((m) => m.name && m.value !== '');
   return `<div class="visit">
     <div class="vh"><strong>${fmtDateTime(v.date)}</strong><span class="badge">${esc(VISIT_TYPES[v.type] || v.type)}</span>
-      ${v.status === 'draft' ? '<span class="badge warn">Draft</span>' : ''}
+      ${v.conflictOf ? '<span class="badge danger">Conflict copy</span>' : ''}${v.status === 'draft' ? '<span class="badge warn">Draft</span>' : ''}
       ${v.pain != null && v.pain !== '' ? `<span class="badge">Pain ${v.pain}</span>` : ''}${v.function != null && v.function !== '' ? `<span class="badge">Function ${v.function}</span>` : ''}
       ${clips ? `<span class="badge gray">🎙 ${clips}</span>` : ''}
       <a class="small" href="#/visit/${v.id}">Open / edit</a></div>
@@ -363,6 +365,8 @@ async function visitView(id, pid, requestedType) {
         <h1 style="margin:0">${existing ? 'Edit visit' : v.type === 'initial' ? 'Initial assessment' : 'Follow-up visit'}</h1></div>
       <span id="saveState" class="muted small" aria-live="polite">${existing ? 'Saved' : 'Not saved yet'}</span>
     </div>
+    ${v.conflictOf ? `<div class="banner warn" style="margin-bottom:.75rem"><strong>Conflict copy.</strong> This visit was edited on two devices at once. The other version was kept as <a href="#/visit/${esc(v.conflictOf)}">the original visit</a>. Copy across anything you need, then delete one of them.</div>` : ''}
+    <div class="banner warn" id="remoteBanner" hidden style="margin-bottom:.75rem"><strong>This visit was changed on another device.</strong> <button type="button" class="btn sm" id="loadTheirs">Load their version</button> <button type="button" class="btn sm" id="keepMine">Keep mine</button></div>
     <form id="vf" class="stack">
       ${prev ? `<div class="prev"><div><b>Last visit · ${fmtDate(prev.date)}</b> ${prev.pain != null && prev.pain !== '' ? ` · pain ${prev.pain}` : ''}${prev.function != null && prev.function !== '' ? ` · function ${prev.function}` : ''}</div>
         ${prev.assessment ? `<p><b>Assessment:</b> ${esc(prev.assessment)}</p>` : ''}${prev.plan ? `<p><b>Plan:</b> ${esc(prev.plan)}</p>` : ''}${prev.hep ? `<p><b>HEP:</b> ${esc(prev.hep)}</p>` : ''}
@@ -412,9 +416,15 @@ async function visitView(id, pid, requestedType) {
 
   $('#vf').addEventListener('submit', (e) => e.preventDefault());
 
+  let discarded = false;
+  const onRemoteChange = (e) => { if (e.detail.has('v:' + v.id)) $('#remoteBanner').hidden = false; };
+  window.addEventListener('remote-change', onRemoteChange);
+  onLeave(() => window.removeEventListener('remote-change', onRemoteChange));
+  $('#loadTheirs').onclick = () => { discarded = true; route(); };
+  $('#keepMine').onclick = () => { $('#remoteBanner').hidden = true; };
+
   // --- saving ---
   const state = $('#saveState');
-  let discarded = false;
   const save = async () => {
     if (discarded) return;
     v.updatedAt = new Date().toISOString();
@@ -624,6 +634,8 @@ async function settingsView() {
       <p class="muted small">Live transcription uses your browser’s speech recognition (Chrome/Edge send audio to their speech service; Safari may too). For maximum privacy, record audio only and transcribe with a local method, or type notes.</p>
     </div>
 
+    ${syncCard()}
+
     <div class="card"><h2>🔒 Account &amp; security</h2>
       <p class="muted small" style="margin-top:0">Signed in as <strong>${esc(session.user.displayName)}</strong> (@${esc(session.user.username)}). Your patients, notes, recordings and API key are encrypted with a key only your password (or recovery key) can unlock. Colleagues using this app can’t see them.</p>
       <div class="grid2"><div><label for="lockMin">Auto-lock after inactivity</label><select id="lockMin">${[5, 10, 15, 30].map((m) => `<option value="${m}" ${s.lockMinutes === m ? 'selected' : ''}>${m} minutes</option>`).join('')}</select></div></div>
@@ -663,6 +675,7 @@ async function settingsView() {
     try { $('#aiMsg').textContent = '✓ ' + await testConnection(); } catch (e) { $('#aiMsg').textContent = '✗ ' + e.message; }
   };
 
+  wireSyncCard();
   $('#lockMin').onchange = () => saveSettings({ ...getSettings(), lockMinutes: +$('#lockMin').value });
 
   const exportAll = async (withAudio) => {
@@ -716,12 +729,20 @@ async function settingsView() {
     const v = await askDialog({ title: 'Change password', fields: [{ name: 'o', label: 'Current password', ac: 'current-password' }, { name: 'n', label: 'New password', ac: 'new-password' }, { name: 'n2', label: 'Repeat new password', ac: 'new-password' }], ok: 'Change password' });
     if (!v) return;
     if (v.n !== v.n2) return toast('New passwords do not match.', true);
-    try { await auth.changePassword(session.user.username, v.o, v.n); toast('Password changed'); } catch (e) { toast(e.message, true); }
+    try {
+      await auth.changePassword(session.user.username, v.o, v.n);
+      toast('Password changed');
+      await sync.pushAccount(auth.publicAccount(session.user.username)).catch(() => toast('Password changed here, but it could not be saved to Dropbox yet — other devices keep the old password until you change it again while online.', true));
+    } catch (e) { toast(e.message, true); }
   };
   $('#newRec').onclick = async () => {
     const v = await askDialog({ title: 'New recovery key', text: 'This replaces your old recovery key.', fields: [{ name: 'p', label: 'Your password', ac: 'current-password' }], ok: 'Generate' });
     if (!v) return;
-    try { await showRecoveryKey(await auth.newRecoveryKey(session.user.username, v.p), session.user.username, () => route()); } catch (e) { toast(e.message, true); }
+    try {
+      const k = await auth.newRecoveryKey(session.user.username, v.p);
+      await sync.pushAccount(auth.publicAccount(session.user.username)).catch(() => {});
+      await showRecoveryKey(k, session.user.username, () => route());
+    } catch (e) { toast(e.message, true); }
   };
   $('#delAcct').onclick = async () => {
     const v = await askDialog({ title: 'Delete my account', text: 'Permanently deletes your account and ALL of your encrypted patient data from this device. This cannot be undone. Export a backup first if you need one.', fields: [{ name: 'p', label: 'Your password', ac: 'current-password' }, { name: 'c', label: 'Type DELETE', type: 'text' }], ok: 'Delete account', danger: true });
@@ -730,11 +751,58 @@ async function settingsView() {
     try {
       const id = await auth.removeAccount(session.user.username, v.p);
       await runCleanups();
+      if (sync.isEnabled()) await sync.disable({ deleteRemote: confirm('Also delete this account’s encrypted copy from your Dropbox?\n\nOK = delete it from Dropbox too\nCancel = leave it in Dropbox') }).catch((e) => toast('Could not update Dropbox: ' + e.message, true));
       session = null; db.lock(); detachSettings(); renderUserbox(); stopIdle();
       await db.destroyUserDb(id);
       toast('Account deleted');
       authView('login');
     } catch (e) { toast(e.message, true); }
+  };
+}
+
+// ---------- sync settings card ----------
+function syncCard() {
+  const on = sync.isEnabled();
+  if (on) {
+    return `<div class="card"><div class="row between"><h2>☁ Sync across devices</h2><span class="badge ok">Connected to Dropbox</span></div>
+      <p class="muted small" style="margin-top:0">Changes sync automatically between your devices. Everything is encrypted on this device first, so Dropbox only stores unreadable files.</p>
+      <div class="small" id="syncInfo" aria-live="polite"></div>
+      <div class="row" style="margin-top:.7rem"><button class="btn" id="syncNow">Sync now</button><button class="btn danger" id="syncOff">Disconnect…</button></div></div>`;
+  }
+  const key = (() => { try { return localStorage.getItem('physio-dbx-appkey') || ''; } catch { return ''; } })();
+  return `<div class="card"><h2>☁ Sync across devices</h2>
+    <p class="muted small" style="margin-top:0">Use PhysioNotes on your phone <em>and</em> laptop. Notes and recordings are encrypted here before they are saved in <strong>your own Dropbox</strong>, so Dropbox can’t read them. Needs the app to be opened from a secure (https) address.</p>
+    <details><summary>One-time Dropbox setup (about 5 minutes)</summary>
+      <ol class="steps"><li>Open <a href="https://www.dropbox.com/developers/apps" target="_blank" rel="noopener">dropbox.com/developers/apps</a> and click <em>Create app</em>.</li>
+      <li>Choose <em>Scoped access</em> → <em>App folder</em>, and give it a name (e.g. “PhysioNotes-yourname”).</li>
+      <li>On the <em>Permissions</em> tab tick <code>files.metadata.read</code>, <code>files.metadata.write</code>, <code>files.content.read</code>, <code>files.content.write</code>, then <em>Submit</em>.</li>
+      <li>On the <em>Settings</em> tab, add this under <em>Redirect URIs</em> and click <em>Add</em>: <code id="redir">${esc(redirectUri())}</code> <button class="btn sm" id="cpRedir" type="button">Copy</button></li>
+      <li>Copy the <em>App key</em> from the same page and paste it below.</li></ol></details>
+    <div class="row" style="margin-top:.8rem"><input id="appKey" class="grow" value="${esc(key)}" placeholder="Dropbox App key" autocomplete="off" spellcheck="false"><button class="btn primary" id="dbxConnect">Connect Dropbox</button></div>
+    <p class="disclaimer">On your other device: open PhysioNotes → sign-in screen → “Set up from Dropbox”, using the same App key. Register each web address you use (e.g. your phone’s and laptop’s) as a redirect URI.</p></div>`;
+}
+function wireSyncCard() {
+  if (sync.isEnabled()) {
+    const show = (st) => { const el = $('#syncInfo'); if (el) el.textContent = ({ idle: 'Up to date', syncing: 'Syncing…', offline: 'Offline — will sync when you’re back online', error: st.msg || 'Sync problem' }[st.status] || '') + (st.last ? ` · last synced ${new Date(st.last).toLocaleTimeString()}` : ''); };
+    show(sync.state);
+    const h = (e) => show(e.detail);
+    window.addEventListener('sync-status', h);
+    onLeave(() => window.removeEventListener('sync-status', h));
+    $('#syncNow').onclick = () => sync.syncNow();
+    $('#syncOff').onclick = async () => {
+      if (!confirm('Disconnect Dropbox on this account? Your data stays on this device and keeps working. Other devices stop receiving changes.')) return;
+      const del = confirm('Also delete the encrypted copy from Dropbox?\n\nOK = delete it from Dropbox\nCancel = leave it in Dropbox');
+      try { await sync.disable({ deleteRemote: del }); toast('Dropbox disconnected'); updateChip({ status: 'off' }); route(); } catch (e) { toast(e.message, true); }
+    };
+    return;
+  }
+  $('#cpRedir').onclick = () => navigator.clipboard?.writeText(redirectUri()).then(() => toast('Copied'), () => {});
+  $('#dbxConnect').onclick = () => {
+    const k = $('#appKey').value.trim();
+    if (!k) return toast('Paste your Dropbox App key first.', true);
+    try { localStorage.setItem('physio-dbx-appkey', k); } catch { /* ignore */ }
+    if (!crypto.subtle || location.protocol === 'file:') return toast('Open the app from https:// (or localhost) to connect Dropbox.', true);
+    beginAuth(k, 'enable');
   };
 }
 
@@ -765,8 +833,9 @@ function renderUserbox() {
   const box = document.getElementById('userbox');
   const nav = document.querySelector('.topbar nav');
   nav.hidden = !session;
-  box.innerHTML = session ? `<span class="userchip" title="@${esc(session.user.username)}"><span class="uav" aria-hidden="true">${esc(session.user.displayName[0].toUpperCase())}</span><span class="uname">${esc(session.user.displayName)}</span></span><button class="btn sm white" id="lockBtn" title="Lock now">🔒 Lock</button><button class="btn sm ghost" id="outBtn" style="color:#fff">Sign out</button>` : '';
+  box.innerHTML = session ? `<span class="userchip" title="@${esc(session.user.username)}"><span class="uav" aria-hidden="true">${esc(session.user.displayName[0].toUpperCase())}</span><span class="uname">${esc(session.user.displayName)}</span></span><button class="btn sm ghost syncchip" id="syncChip" hidden title="Sync now"></button><button class="btn sm white" id="lockBtn" title="Lock now">🔒 Lock</button><button class="btn sm ghost" id="outBtn" style="color:#fff">Sign out</button>` : '';
   if (session) {
+    $('#syncChip', box).onclick = () => sync.syncNow();
     $('#lockBtn', box).onclick = () => lockApp('Locked.');
     $('#outBtn', box).onclick = () => lockApp('Signed out.', true);
   }
@@ -776,6 +845,7 @@ async function lockApp(notice, signOut = false) {
   if (!session) return;
   stopIdle();
   await runCleanups(); // flushes autosave and stops any recording before the key is dropped
+  await sync.stop();   // pushes pending edits to the cloud folder, then detaches
   lastUserId = signOut ? null : session.user.id;
   session = null;
   db.lock();
@@ -785,14 +855,77 @@ async function lockApp(notice, signOut = false) {
   authView('login', { notice });
 }
 
+let pendingDbx = null; // { tokens, intent } between returning from Dropbox and signing in
+
+const CHIP = { idle: '☁ Synced', syncing: '⟳ Syncing…', offline: '☁ Offline', error: '⚠ Sync issue' };
+function updateChip(st) {
+  const c = document.getElementById('syncChip');
+  if (!c) return;
+  c.hidden = st.status === 'off';
+  c.textContent = CHIP[st.status] || '';
+  c.title = st.msg || (st.last ? 'Last synced ' + new Date(st.last).toLocaleTimeString() + ' — click to sync now' : 'Sync now');
+  c.classList.toggle('bad', st.status === 'error');
+}
+
+async function handleRemote(changed) {
+  if (!session) return;
+  if (changed.has('s:main')) {
+    const saved = await db.get('settings', 'main').catch(() => null);
+    if (saved) { const { id: _i, ...rest } = saved; attachSettings(rest, (o) => db.put('settings', { id: 'main', ...o, updatedAt: new Date().toISOString() }).catch(console.error)); }
+  }
+  window.dispatchEvent(new CustomEvent('remote-change', { detail: changed }));
+  const h = location.hash;
+  if (h.startsWith('#/visit/') || h.includes('/visit/new') || h.startsWith('#/settings') || /\/edit$/.test(h) || h === '#/patient/new') return; // don't disturb an open form
+  await route();
+}
+
+async function handleDropboxReturn(ret) {
+  if (ret.error) return authView(undefined, { notice: ret.error });
+  try {
+    const tokens = await exchangeCode(ret);
+    pendingDbx = { tokens, intent: ret.intent };
+    if (ret.intent === 'newdevice') return await newDeviceView();
+    authView('login', { notice: 'Dropbox is authorized. Sign in to finish connecting.' });
+  } catch (e) { authView(undefined, { notice: 'Dropbox connection failed: ' + e.message }); }
+}
+
+// Set up this device from an existing account stored in the user's Dropbox.
+async function newDeviceView() {
+  app.innerHTML = `<div class="auth"><div class="card auth-card"><div class="auth-logo" aria-hidden="true">☁</div><h1>Your Dropbox</h1><p class="muted"><span class="spinner"></span> Looking for your PhysioNotes account…</p></div></div>`;
+  let found = [];
+  try { found = await sync.findAccounts(pendingDbx.tokens); } catch (e) { pendingDbx = null; return authView('login', { notice: 'Could not read Dropbox: ' + e.message }); }
+  app.innerHTML = `<div class="auth"><div class="card auth-card stack"><div class="auth-logo" aria-hidden="true">☁</div><h1>${found.length ? 'Choose your account' : 'Nothing found yet'}</h1>
+    ${found.length ? `<p class="muted" style="margin:0">Pick the account to open on this device. You’ll sign in with the same password you use elsewhere.</p>
+      <div class="picker" style="flex-direction:column;align-items:stretch">${found.map((a, i) => `<button type="button" class="pick" data-i="${i}"><span class="uav">${esc((a.displayName || a.username)[0].toUpperCase())}</span>${esc(a.displayName || a.username)} <span class="muted small">@${esc(a.username)}</span></button>`).join('')}</div>`
+      : '<p class="muted">This Dropbox has no PhysioNotes account yet. On your first device, open Settings → Sync across devices and connect Dropbox first.</p>'}
+    <div id="authErr" class="banner danger" role="alert" hidden></div>
+    <a href="#" id="back" class="small" style="text-align:center">Cancel</a></div></div>`;
+  $('#back').onclick = (e) => { e.preventDefault(); pendingDbx = null; authView('login'); };
+  $$('.pick').forEach((b) => (b.onclick = () => {
+    try {
+      const u = auth.importAccount(found[+b.dataset.i]);
+      authView('login', { notice: `Account added. Sign in as ${u.displayName}.` });
+      $('#username').value = u.username; $('#password').focus();
+    } catch (e) { const el = $('#authErr'); el.textContent = e.message; el.hidden = false; }
+  }));
+}
+
 async function startSession(user, key) {
   await db.openUser(user.id, key);
   const saved = await db.get('settings', 'main').catch(() => null);
   const { id: _id, ...rest } = saved || {};
-  attachSettings(rest, (o) => db.put('settings', { id: 'main', ...o }).catch((e) => console.error(e)));
+  attachSettings(rest, (o) => db.put('settings', { id: 'main', ...o, updatedAt: new Date().toISOString() }).catch((e) => console.error(e)));
   session = { user };
   renderUserbox();
   startIdle();
+  const hooks = { onStatus: updateChip, onRemote: handleRemote };
+  try {
+    if (pendingDbx) {
+      const p = pendingDbx; pendingDbx = null;
+      await sync.enable(p.tokens, user, auth.publicAccount(user.username), hooks);
+      toast('Dropbox connected — syncing…');
+    } else await sync.start(user, hooks);
+  } catch (e) { console.error(e); toast('Could not start Dropbox sync: ' + e.message, true); }
   if (user.id !== lastUserId) history.replaceState(null, '', '#/');
   lastUserId = user.id;
   await route();
@@ -814,7 +947,9 @@ function authView(mode, opts = {}) {
       <form id="af" class="stack">${field('username', 'Username', 'text', 'username', 'autocapitalize="none" spellcheck="false"')}${field('password', 'Password', 'password', 'current-password')}
       <div id="authErr" class="banner danger" role="alert" hidden></div>
       <button class="btn primary" id="go" data-label="Sign in" type="submit">Sign in</button></form>
-      <div class="row between small" style="margin-top:.8rem"><a href="#" id="toRecover">Forgot password?</a><a href="#" id="toSignup">Create an account</a></div>`);
+      <div class="row between small" style="margin-top:.8rem"><a href="#" id="toRecover">Forgot password?</a><a href="#" id="toSignup">Create an account</a></div>
+      <p class="small" style="text-align:center;margin:.9rem 0 0"><a href="#" id="toDevice">Already use PhysioNotes on another device? Set up from Dropbox →</a></p>`);
+    $('#toDevice').onclick = (e) => { e.preventDefault(); deviceConnectView(); };
     $$('.pick').forEach((b) => (b.onclick = () => { $('#username').value = b.dataset.u; $('#password').focus(); }));
     if (accounts.length === 1) $('#username').value = accounts[0].username;
     (accounts.length === 1 ? $('#password') : $('#username')).focus();
@@ -834,8 +969,9 @@ function authView(mode, opts = {}) {
       <div class="warnbox">There’s no central server, so <strong>nobody can reset your password for you</strong>. You’ll get a one-time recovery key on the next screen — keep it somewhere safe.</div>
       <div id="authErr" class="banner danger" role="alert" hidden></div>
       <button class="btn primary" id="go" data-label="Create account" type="submit">Create account</button></form>
-      ${accounts.length ? '<p class="small" style="text-align:center"><a href="#" id="toLogin">Back to sign in</a></p>' : ''}`);
+      <p class="small" style="text-align:center;margin:.4rem 0 0">${accounts.length ? '<a href="#" id="toLogin">Back to sign in</a> · ' : ''}<a href="#" id="toDevice">Already use PhysioNotes on another device? Set up from Dropbox →</a></p>`);
     $('#toLogin')?.addEventListener('click', (e) => { e.preventDefault(); authView('login'); });
+    $('#toDevice').onclick = (e) => { e.preventDefault(); deviceConnectView(); };
     $('#displayName').focus();
     $('#af').onsubmit = async (e) => {
       e.preventDefault(); err('');
@@ -864,6 +1000,17 @@ function authView(mode, opts = {}) {
       } catch (x) { err(x.message); busyBtn($('#go'), false); }
     };
   }
+}
+
+function deviceConnectView() {
+  const saved = (() => { try { return localStorage.getItem('physio-dbx-appkey') || ''; } catch { return ''; } })();
+  app.innerHTML = `<div class="auth"><div class="card auth-card stack"><div class="auth-logo" aria-hidden="true">☁</div><h1>Set up from Dropbox</h1>
+    <p class="muted" style="margin:0">Connect the same Dropbox you use on your other device. Your notes are downloaded and decrypted here with your password.</p>
+    <form id="af" class="stack"><div><label for="appkey">Dropbox App key</label><input id="appkey" value="${esc(saved)}" required autocomplete="off" spellcheck="false" placeholder="The key you created in Settings → Sync on your other device"></div>
+    <div class="small muted">Redirect address to allow in your Dropbox app: <code>${esc(redirectUri())}</code></div>
+    <button class="btn primary" type="submit">Connect Dropbox</button></form><a href="#" id="back" class="small" style="text-align:center">Back to sign in</a></div></div>`;
+  $('#back').onclick = (e) => { e.preventDefault(); authView('login'); };
+  $('#af').onsubmit = (e) => { e.preventDefault(); const k = $('#appkey').value.trim(); try { localStorage.setItem('physio-dbx-appkey', k); } catch { /* ignore */ } beginAuth(k, 'newdevice'); };
 }
 
 function showRecoveryKey(key, username, next, heading = 'Save your recovery key') {
@@ -912,4 +1059,6 @@ function stopIdle() {
 if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
 navigator.storage?.persist?.().catch(() => {});
 renderUserbox();
-route(); // not signed in yet -> shows the sign-in / set-up screen
+const dbxReturn = takeAuthReturn(); // coming back from Dropbox's sign-in page?
+if (dbxReturn) handleDropboxReturn(dbxReturn);
+else route(); // not signed in yet -> shows the sign-in / set-up screen

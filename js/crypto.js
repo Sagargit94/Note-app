@@ -84,3 +84,17 @@ export async function decryptWithPassphrase(passphrase, file) {
     return td.decode(await subtle.decrypt({ name: 'AES-GCM', iv: b64d(file.iv) }, key, b64d(file.data)));
   } catch { throw new Error('Wrong passphrase or damaged backup file.'); }
 }
+
+// --- ciphertext rows <-> JSON (for sync files) ---
+export function rowToWire(row) {
+  const w = { id: row.id, iv: b64e(row.iv), ct: b64e(row.ct) };
+  if (row.bl) w.bl = { iv: b64e(row.bl.iv), ct: b64e(row.bl.ct) };
+  if (row.mime) w.mime = row.mime;
+  return w;
+}
+export function wireToRow(w) {
+  const row = { id: w.id, iv: b64d(w.iv), ct: b64d(w.ct).buffer };
+  if (w.bl) row.bl = { iv: b64d(w.bl.iv), ct: b64d(w.bl.ct).buffer };
+  if (w.mime) row.mime = w.mime;
+  return row;
+}

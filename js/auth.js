@@ -116,3 +116,19 @@ export async function removeAccount(username, password) {
   saveAccounts(accounts.filter((x) => x !== a));
   return a.id;
 }
+
+// The registry entry holds only public material (salts + wrapped keys), so it is what gets synced to new devices.
+export function publicAccount(username) { return { ...find(listAccounts(), username) }; }
+
+// Adds (or refreshes, e.g. after a password change on another device) an account fetched from the user's cloud folder.
+export function importAccount(blob) {
+  const ok = blob && typeof blob.id === 'string' && /^[a-z0-9._-]{3,32}$/.test(blob.username || '') && blob.kdf?.salt && blob.pw?.w && blob.rec?.w;
+  if (!ok) throw new Error('That account file is damaged.');
+  const accounts = listAccounts();
+  if (accounts.some((x) => x.username === blob.username && x.id !== blob.id)) throw new Error(`A different account called @${blob.username} already exists on this device.`);
+  const entry = { id: blob.id, username: blob.username, displayName: blob.displayName || blob.username, createdAt: blob.createdAt, kdf: blob.kdf, pw: blob.pw, rec: blob.rec };
+  const i = accounts.findIndex((x) => x.id === blob.id);
+  if (i >= 0) accounts[i] = entry; else accounts.push(entry);
+  saveAccounts(accounts);
+  return pub(entry);
+}
