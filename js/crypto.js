@@ -32,6 +32,19 @@ async function kekFrom(secret, salt, iterations) {
 export const passwordKek = (password, salt, iterations = PBKDF2_ITER) => kekFrom(password.normalize('NFKC'), salt, iterations);
 export const recoveryKek = (recoveryKey, salt) => kekFrom(normalizeRecovery(recoveryKey), salt, REC_ITER);
 
+// One PBKDF2 run yields (a) the key-encryption key and (b) a separate "clinic login secret" derived from the same
+// bytes by HMAC with a fixed label. The server only ever sees (b) -- it can't be turned back into the password or
+// the key. The first 256 bits are identical to what passwordKek() derives, so existing accounts keep working.
+export async function deriveKeys(password, salt, iterations = PBKDF2_ITER) {
+  const base = await subtle.importKey('raw', te.encode(password.normalize('NFKC')), 'PBKDF2', false, ['deriveBits']);
+  const bits = new Uint8Array(await subtle.deriveBits({ name: 'PBKDF2', salt, iterations, hash: 'SHA-256' }, base, 256));
+  const kek = await subtle.importKey('raw', bits, { name: 'AES-GCM' }, false, ['wrapKey', 'unwrapKey']);
+  const mac = await subtle.importKey('raw', bits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = new Uint8Array(await subtle.sign('HMAC', mac, te.encode('physionotes-clinic-login-v1')));
+  bits.fill(0);
+  return { kek, authSecret: b64e(sig).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') };
+}
+
 export const newDataKey = () => subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
 
 export async function wrapDek(dek, kek) {

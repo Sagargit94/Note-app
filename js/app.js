@@ -1,6 +1,7 @@
 import * as db from './db.js';
 import * as auth from './auth.js';
 import * as sync from './sync.js';
+import * as central from './central.js';
 import { beginAuth, takeAuthReturn, exchangeCode, redirectUri } from './dropbox.js';
 import { encryptWithPassphrase, decryptWithPassphrase } from './crypto.js';
 import { esc, uid, fmtDate, fmtDateTime, fmtDur, age, debounce, toLocalInput, fromLocalInput, mdToHtml, download, blobToBase64, base64ToBlob } from './util.js';
@@ -10,6 +11,7 @@ import { attachSettings, detachSettings, getSettings, saveSettings, runReview, r
 import { Recorder, speechSupported, recordingSupported } from './voice.js';
 
 const app = document.getElementById('app');
+const CLINIC_ON = central.enabled(); // clinic mode: central sign-in, approval, admin directory
 const $ = (sel, root = app) => root.querySelector(sel);
 const $$ = (sel, root = app) => [...root.querySelectorAll(sel)];
 
@@ -53,10 +55,11 @@ async function route() {
   await runCleanups();
   if (!session) return authView();
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
-  $$('[data-nav]', document).forEach((a) => a.classList.toggle('active', a.dataset.nav === (parts[0] === 'settings' ? 'settings' : 'patients')));
+  $$('[data-nav]', document).forEach((a) => a.classList.toggle('active', a.dataset.nav === (parts[0] === 'settings' ? 'settings' : parts[0] === 'admin' ? 'admin' : 'patients')));
   try {
     if (!parts.length) await patientsView();
     else if (parts[0] === 'settings') await settingsView();
+    else if (parts[0] === 'admin') await adminView();
     else if (parts[0] === 'patient' && parts[1] === 'new') await patientForm();
     else if (parts[0] === 'patient' && parts[2] === 'edit') await patientForm(parts[1]);
     else if (parts[0] === 'patient' && parts[2] === 'visit' && parts[3] === 'new') await visitView(null, parts[1], parts[4]);
@@ -733,17 +736,25 @@ async function settingsView() {
     if (!v) return;
     if (v.n !== v.n2) return toast('New passwords do not match.', true);
     try {
-      await auth.changePassword(session.user.username, v.o, v.n);
+      const oldSecret = central.currentSecret();
+      await auth.changePassword(session.user.username, v.o, v.n, CLINIC_ON ? {
+        // the clinic server is updated first; if that fails nothing changes on this device either
+        commit: async ({ account, authSecret }) => {
+          await central.updatePassword(authSecret);
+          try { await central.rpc('update_account_blob', { blob: account }); }
+          catch (e) { if (oldSecret) await central.updatePassword(oldSecret).catch(() => {}); throw e; }
+        },
+      } : {});
       toast('Password changed');
-      await sync.pushAccount(auth.publicAccount(session.user.username)).catch(() => toast('Password changed here, but it could not be saved to Dropbox yet — other devices keep the old password until you change it again while online.', true));
-    } catch (e) { toast(e.message, true); }
+      if (!CLINIC_ON) await sync.pushAccount(auth.publicAccount(session.user.username)).catch(() => toast('Password changed here, but it could not be saved to Dropbox yet — other devices keep the old password until you change it again while online.', true));
+    } catch (e) { toast(e instanceof TypeError ? 'You need to be online to change your password.' : e.message, true); }
   };
   $('#newRec').onclick = async () => {
     const v = await askDialog({ title: 'New recovery key', text: 'This replaces your old recovery key.', fields: [{ name: 'p', label: 'Your password', ac: 'current-password' }], ok: 'Generate' });
     if (!v) return;
     try {
-      const k = await auth.newRecoveryKey(session.user.username, v.p);
-      await sync.pushAccount(auth.publicAccount(session.user.username)).catch(() => {});
+      const k = await auth.newRecoveryKey(session.user.username, v.p, CLINIC_ON ? { commit: async ({ account }) => { await central.rpc('update_account_blob', { blob: account }); } } : {});
+      if (!CLINIC_ON) await sync.pushAccount(auth.publicAccount(session.user.username)).catch(() => {});
       await showRecoveryKey(k, session.user.username, () => route());
     } catch (e) { toast(e.message, true); }
   };
@@ -752,7 +763,7 @@ async function settingsView() {
     if (!v) return;
     if (v.c !== 'DELETE') return toast('Type DELETE to confirm.', true);
     try {
-      const id = await auth.removeAccount(session.user.username, v.p);
+      const id = await auth.removeAccount(session.user.username, v.p, { beforeRemove: CLINIC_ON ? () => central.rpc('delete_me') : undefined });
       await runCleanups();
       if (sync.isEnabled()) await sync.disable({ deleteRemote: confirm('Also delete this account’s encrypted copy from your Dropbox?\n\nOK = delete it from Dropbox too\nCancel = leave it in Dropbox') }).catch((e) => toast('Could not update Dropbox: ' + e.message, true));
       session = null; db.lock(); detachSettings(); renderUserbox(); stopIdle();
@@ -765,6 +776,11 @@ async function settingsView() {
 
 // ---------- sync settings card ----------
 function syncCard() {
+  if (CLINIC_ON) {
+    return `<div class="card"><div class="row between"><h2>☁ Clinic sync</h2><span class="badge ok">${esc(central.clinicName())}</span></div>
+      <p class="muted small" style="margin-top:0">Your notes sync automatically between your devices through the clinic’s server. Everything is encrypted on this device first, so neither the server nor the clinic administrators can read your patients.</p>
+      <div class="small" id="syncInfo" aria-live="polite"></div><div class="row" style="margin-top:.7rem"><button class="btn" id="syncNow">Sync now</button></div></div>`;
+  }
   const on = sync.isEnabled();
   if (on) {
     return `<div class="card"><div class="row between"><h2>☁ Sync across devices</h2><span class="badge ok">Connected to Dropbox</span></div>
@@ -785,14 +801,14 @@ function syncCard() {
     <p class="disclaimer">On your other device: open PhysioNotes → sign-in screen → “Set up from Dropbox”, using the same App key. Register each web address you use (e.g. your phone’s and laptop’s) as a redirect URI.</p></div>`;
 }
 function wireSyncCard() {
-  if (sync.isEnabled()) {
+  if (CLINIC_ON || sync.isEnabled()) {
     const show = (st) => { const el = $('#syncInfo'); if (el) el.textContent = ({ idle: 'Up to date', syncing: 'Syncing…', offline: 'Offline — will sync when you’re back online', error: st.msg || 'Sync problem' }[st.status] || '') + (st.last ? ` · last synced ${new Date(st.last).toLocaleTimeString()}` : ''); };
     show(sync.state);
     const h = (e) => show(e.detail);
     window.addEventListener('sync-status', h);
     onLeave(() => window.removeEventListener('sync-status', h));
     $('#syncNow').onclick = () => sync.syncNow();
-    $('#syncOff').onclick = async () => {
+    if ($('#syncOff')) $('#syncOff').onclick = async () => {
       if (!confirm('Disconnect Dropbox on this account? Your data stays on this device and keeps working. Other devices stop receiving changes.')) return;
       const del = confirm('Also delete the encrypted copy from Dropbox?\n\nOK = delete it from Dropbox\nCancel = leave it in Dropbox');
       try { await sync.disable({ deleteRemote: del }); toast('Dropbox disconnected'); updateChip({ status: 'off' }); route(); } catch (e) { toast(e.message, true); }
@@ -837,6 +853,7 @@ function renderUserbox() {
   const nav = document.querySelector('.topbar nav');
   nav.hidden = !session;
   box.innerHTML = session ? `<span class="userchip" title="@${esc(session.user.username)}"><span class="uav" aria-hidden="true">${esc(session.user.displayName[0].toUpperCase())}</span><span class="uname">${esc(session.user.displayName)}</span></span><button class="btn sm ghost syncchip" id="syncChip" hidden title="Sync now"></button><button class="btn sm white" id="lockBtn" title="Lock now">🔒 Lock</button><button class="btn sm ghost" id="outBtn" style="color:#fff">Sign out</button>` : '';
+  applyProfile();
   if (session) {
     $('#syncChip', box).onclick = () => sync.syncNow();
     $('#lockBtn', box).onclick = () => lockApp('Locked.');
@@ -850,6 +867,7 @@ async function lockApp(notice, signOut = false) {
   await runCleanups(); // flushes autosave and stops any recording before the key is dropped
   await sync.stop();   // pushes pending edits to the cloud folder, then detaches
   lastUserId = signOut ? null : session.user.id;
+  if (CLINIC_ON) { if (signOut) await central.signOut(); else central.clear(); }
   session = null;
   db.lock();
   detachSettings();
@@ -858,6 +876,7 @@ async function lockApp(notice, signOut = false) {
   authView('login', { notice });
 }
 
+const syncHooks = { onStatus: (st) => updateChip(st), onRemote: (c) => handleRemote(c) };
 let pendingDbx = null; // { tokens, intent } between returning from Dropbox and signing in
 
 const CHIP = { idle: '☁ Synced', syncing: '⟳ Syncing…', offline: '☁ Offline', error: '⚠ Sync issue' };
@@ -913,22 +932,23 @@ async function newDeviceView() {
   }));
 }
 
-async function startSession(user, key) {
+async function startSession(user, key, profile = null) {
   await db.openUser(user.id, key);
   const saved = await db.get('settings', 'main').catch(() => null);
   const { id: _id, ...rest } = saved || {};
   attachSettings(rest, (o) => db.put('settings', { id: 'main', ...o, updatedAt: new Date().toISOString() }).catch((e) => console.error(e)));
-  session = { user };
+  session = { user, profile };
   renderUserbox();
   startIdle();
-  const hooks = { onStatus: updateChip, onRemote: handleRemote };
+  const hooks = syncHooks;
   try {
-    if (pendingDbx) {
+    if (CLINIC_ON) { if (central.hasSession()) await sync.startCentral(user, hooks); }
+    else if (pendingDbx) {
       const p = pendingDbx; pendingDbx = null;
       await sync.enable(p.tokens, user, auth.publicAccount(user.username), hooks);
       toast('Dropbox connected — syncing…');
     } else await sync.start(user, hooks);
-  } catch (e) { console.error(e); toast('Could not start Dropbox sync: ' + e.message, true); }
+  } catch (e) { console.error(e); toast('Could not start sync: ' + e.message, true); }
   if (user.id !== lastUserId) history.replaceState(null, '', '#/');
   lastUserId = user.id;
   await route();
@@ -945,14 +965,14 @@ function authView(mode, opts = {}) {
   const field = (id, label, type = 'text', ac = 'off', extra = '') => `<div><label for="${id}">${label}</label><input id="${id}" name="${id}" type="${type}" autocomplete="${ac}" required ${extra}></div>`;
 
   if (mode === 'login') {
-    shell(`<h1>Welcome back</h1><p class="muted" style="margin-top:0">${opts.notice ? esc(opts.notice) + ' ' : ''}Sign in to open your patients.</p>
+    shell(`<h1>Welcome back</h1><p class="muted" style="margin-top:0">${opts.notice ? esc(opts.notice) + ' ' : ''}${CLINIC_ON ? 'Sign in to ' + esc(central.clinicName()) + '.' : 'Sign in to open your patients.'}</p>
       ${accounts.length ? `<div class="picker">${accounts.map((a) => `<button type="button" class="pick" data-u="${esc(a.username)}"><span class="uav">${esc(a.displayName[0].toUpperCase())}</span>${esc(a.displayName)}</button>`).join('')}</div>` : ''}
-      <form id="af" class="stack">${field('username', 'Username', 'text', 'username', 'autocapitalize="none" spellcheck="false"')}${field('password', 'Password', 'password', 'current-password')}
+      <form id="af" class="stack">${CLINIC_ON ? field('username', 'Email', 'email', 'username', 'autocapitalize="none" spellcheck="false"') : field('username', 'Username', 'text', 'username', 'autocapitalize="none" spellcheck="false"')}${field('password', 'Password', 'password', 'current-password')}
       <div id="authErr" class="banner danger" role="alert" hidden></div>
       <button class="btn primary" id="go" data-label="Sign in" type="submit">Sign in</button></form>
       <div class="row between small" style="margin-top:.8rem"><a href="#" id="toRecover">Forgot password?</a><a href="#" id="toSignup">Create an account</a></div>
-      <p class="small" style="text-align:center;margin:.9rem 0 0"><a href="#" id="toDevice">Already use PhysioNotes on another device? Set up from Dropbox →</a></p>`);
-    $('#toDevice').onclick = (e) => { e.preventDefault(); deviceConnectView(); };
+      ${CLINIC_ON ? '' : '<p class="small" style="text-align:center;margin:.9rem 0 0"><a href="#" id="toDevice">Already use PhysioNotes on another device? Set up from Dropbox →</a></p>'}`);
+    $('#toDevice')?.addEventListener('click', (e) => { e.preventDefault(); deviceConnectView(); });
     $$('.pick').forEach((b) => (b.onclick = () => { $('#username').value = b.dataset.u; $('#password').focus(); }));
     if (accounts.length === 1) $('#username').value = accounts[0].username;
     (accounts.length === 1 ? $('#password') : $('#username')).focus();
@@ -961,31 +981,36 @@ function authView(mode, opts = {}) {
     $('#af').onsubmit = async (e) => {
       e.preventDefault(); err('');
       busyBtn($('#go'), true, 'Unlocking…');
-      try { const { user, key } = await auth.logIn($('#username').value, $('#password').value); await startSession(user, key); }
+      try {
+        if (CLINIC_ON) await clinicSignIn($('#username').value, $('#password').value);
+        else { const { user, key } = await auth.logIn($('#username').value, $('#password').value); await startSession(user, key); }
+      }
       catch (x) { err(x.message); busyBtn($('#go'), false); $('#password').value = ''; $('#password').focus(); }
     };
   } else if (mode === 'signup') {
     shell(`<h1>${accounts.length ? 'Create your account' : 'Set up PhysioNotes'}</h1>
-      <p class="muted" style="margin-top:0">Each clinician has a private account. Patients and notes you add are visible <strong>only to you</strong>.</p>
-      <form id="af" class="stack">${field('displayName', 'Your name', 'text', 'name', 'placeholder="e.g. Sam Patel, RPT"')}${field('username', 'Username', 'text', 'username', 'autocapitalize="none" spellcheck="false" placeholder="letters and numbers"')}
+      <p class="muted" style="margin-top:0">Each clinician has a private account. Patients and notes you add are visible <strong>only to you</strong>.${CLINIC_ON ? ' New accounts must be approved by your clinic administrator before you can sign in.' : ''}</p>
+      <form id="af" class="stack">${field('displayName', 'Your name', 'text', 'name', 'placeholder="e.g. Sam Patel, RPT"')}${CLINIC_ON ? field('username', 'Work email', 'email', 'username', 'autocapitalize="none" spellcheck="false"') : field('username', 'Username', 'text', 'username', 'autocapitalize="none" spellcheck="false" placeholder="letters and numbers"')}
       ${field('password', `Password (min ${auth.MIN_PASSWORD} characters)`, 'password', 'new-password')}${field('password2', 'Repeat password', 'password', 'new-password')}
-      <div class="warnbox">There’s no central server, so <strong>nobody can reset your password for you</strong>. You’ll get a one-time recovery key on the next screen — keep it somewhere safe.</div>
+      <div class="warnbox">${CLINIC_ON ? 'Your patients are encrypted with your password, so <strong>not even the clinic administrator can read them or reset it for you</strong>.' : 'There’s no central server, so <strong>nobody can reset your password for you</strong>.'} You’ll get a one-time recovery key on the next screen — keep it somewhere safe.</div>
       <div id="authErr" class="banner danger" role="alert" hidden></div>
       <button class="btn primary" id="go" data-label="Create account" type="submit">Create account</button></form>
-      <p class="small" style="text-align:center;margin:.4rem 0 0">${accounts.length ? '<a href="#" id="toLogin">Back to sign in</a> · ' : ''}<a href="#" id="toDevice">Already use PhysioNotes on another device? Set up from Dropbox →</a></p>`);
+      <p class="small" style="text-align:center;margin:.4rem 0 0">${accounts.length ? '<a href="#" id="toLogin">Back to sign in</a> · ' : CLINIC_ON ? '<a href="#" id="toLogin">Already have a clinic account? Sign in</a>' : ''}${CLINIC_ON ? '' : '<a href="#" id="toDevice">Already use PhysioNotes on another device? Set up from Dropbox →</a>'}</p>`);
     $('#toLogin')?.addEventListener('click', (e) => { e.preventDefault(); authView('login'); });
-    $('#toDevice').onclick = (e) => { e.preventDefault(); deviceConnectView(); };
+    $('#toDevice')?.addEventListener('click', (e) => { e.preventDefault(); deviceConnectView(); });
     $('#displayName').focus();
     $('#af').onsubmit = async (e) => {
       e.preventDefault(); err('');
       if ($('#password').value !== $('#password2').value) return err('Passwords do not match.');
       busyBtn($('#go'), true, 'Creating encrypted account…');
       try {
+        if (CLINIC_ON) return await clinicSignUp($('#displayName').value, $('#username').value, $('#password').value);
         const r = await auth.signUp({ username: $('#username').value, displayName: $('#displayName').value, password: $('#password').value });
         await showRecoveryKey(r.recoveryKey, r.user.username, () => startSession(r.user, r.key));
       } catch (x) { err(x.message); busyBtn($('#go'), false); }
     };
   } else if (mode === 'recover') {
+    if (CLINIC_ON) return clinicRecoverView();
     shell(`<h1>Reset password</h1><p class="muted" style="margin-top:0">Enter the recovery key you saved when you created your account.</p>
       <form id="af" class="stack">${field('username', 'Username', 'text', 'username', 'autocapitalize="none"')}${field('rkey', 'Recovery key', 'text', 'off', 'placeholder="XXXX-XXXX-XXXX-…" spellcheck="false" autocapitalize="characters"')}
       ${field('password', `New password (min ${auth.MIN_PASSWORD} characters)`, 'password', 'new-password')}
@@ -1003,6 +1028,185 @@ function authView(mode, opts = {}) {
       } catch (x) { err(x.message); busyBtn($('#go'), false); }
     };
   }
+}
+
+// ---------- clinic mode: sign-in, sign-up, approval gate, password reset ----------
+function gateView(kind, email) {
+  central.clear();
+  const pending = kind === 'pending';
+  app.innerHTML = `<div class="auth"><div class="card auth-card stack" style="text-align:center"><div class="auth-logo" aria-hidden="true">${pending ? '⏳' : '⛔'}</div>
+    <h1>${pending ? 'Waiting for approval' : 'Access disabled'}</h1>
+    <p class="muted" style="margin:0">${pending ? `An administrator at ${esc(central.clinicName())} needs to approve <strong>${esc(email)}</strong> before you can sign in. You can close this page — just sign in again once they have.`
+      : `Your access to ${esc(central.clinicName())} has been disabled. Please contact your clinic administrator.`}</p>
+    <button class="btn primary" id="back">Back to sign in</button></div></div>`;
+  $('#back').onclick = () => authView('login');
+}
+
+async function clinicSignUp(displayName, email, password) {
+  const r = await auth.signUp({ username: email, displayName, password, central: true });
+  try { await central.signUp(r.user.username, r.authSecret); }
+  catch (e) {
+    auth.forgetAccount(r.user.id); central.clear();
+    throw e instanceof TypeError ? new Error('Could not reach the clinic server. Check your connection and try again.') : e;
+  }
+  const reg = await central.rpc('register_account', { name: r.user.displayName, blob: auth.publicAccount(r.user.username) }).catch(() => null);
+  await showRecoveryKey(r.recoveryKey, r.user.username, async () => {
+    if (reg?.status === 'active') await startSession(r.user, r.key, await central.rpc('my_profile'));
+    else if (reg) gateView('pending', r.user.username);
+    else { central.clear(); authView('login', { notice: 'Almost there — sign in to finish creating your clinic account.' }); }
+  });
+}
+
+async function clinicSignIn(emailRaw, password) {
+  const email = String(emailRaw).trim().toLowerCase();
+  const local = auth.listAccounts().find((a) => a.username === email);
+  let res = null;
+  if (local) { try { res = await auth.logIn(email, password); } catch { res = null; } }
+
+  if (!res) { // new device, or the password was changed on another device: ask the clinic
+    let kdf;
+    try { kdf = await central.kdfParams(email); }
+    catch (e) { throw e instanceof TypeError ? new Error(local ? 'Incorrect email or password.' : 'You appear to be offline. Connect to the internet to sign in on a new device.') : e; }
+    await central.signIn(email, await auth.deriveAuthSecret(password, kdf)); // throws "Incorrect email or password" / "disabled"
+    const prof = await central.rpc('my_profile');
+    if (prof.status === 'pending') return gateView('pending', email);
+    if (prof.status !== 'active' || !prof.blob) return gateView('disabled', email);
+    auth.importAccount(prof.blob);
+    res = await auth.logIn(email, password);
+    return startSession(res.user, res.key, prof);
+  }
+
+  try { await central.signIn(email, res.authSecret); }
+  catch (e) {
+    if (e instanceof TypeError) { central.prime(email, res.authSecret); return startSession(res.user, res.key, null); } // offline: open the local copy; the clinic is re-checked when back online
+    if (e.code === 'bad_credentials') throw new Error('Your password was changed on another device. Please sign in with your new password.');
+    throw e;
+  }
+  let prof = await central.rpc('my_profile');
+  if (prof.status === 'unregistered') { // sign-up was interrupted earlier: finish registering
+    await central.rpc('register_account', { name: res.user.displayName, blob: auth.publicAccount(email) });
+    prof = await central.rpc('my_profile');
+  }
+  if (prof.status === 'pending') return gateView('pending', email);
+  if (prof.status !== 'active') return gateView('disabled', email);
+  return startSession(res.user, res.key, prof);
+}
+
+function clinicRecoverView() {
+  app.innerHTML = `<div class="auth"><div class="card auth-card stack"><div class="auth-logo" aria-hidden="true">🔑</div><h1>Reset password</h1>
+    <p class="muted" style="margin:0">We’ll email you a reset link. When you open it on this device you’ll enter the <strong>recovery key</strong> you saved at sign-up — that key is what unlocks your encrypted patients, so the email alone is not enough.</p>
+    <form id="af" class="stack"><div><label for="email">Email</label><input id="email" type="email" required autocomplete="username" autocapitalize="none"></div>
+    <div id="authErr" class="banner danger" role="alert" hidden></div><div id="authOk" class="banner" hidden style="background:var(--ok-l);color:var(--ok)"></div>
+    <button class="btn primary" id="go" data-label="Send reset link" type="submit">Send reset link</button></form>
+    <p class="small" style="text-align:center"><a href="#" id="toLogin">Back to sign in</a></p></div></div>`;
+  $('#toLogin').onclick = (e) => { e.preventDefault(); authView('login'); };
+  $('#af').onsubmit = async (e) => {
+    e.preventDefault(); $('#authErr').hidden = true;
+    busyBtn($('#go'), true, 'Sending…');
+    try {
+      await central.recoverEmail($('#email').value.trim().toLowerCase(), redirectUri());
+      const ok = $('#authOk'); ok.textContent = 'If that email has an account, a reset link is on its way. Open it on this device.'; ok.hidden = false;
+    } catch (x) { const er = $('#authErr'); er.textContent = x instanceof TypeError ? 'Could not reach the clinic server.' : x.message; er.hidden = false; }
+    busyBtn($('#go'), false);
+  };
+}
+
+async function handleRecoveryReturn() {
+  let r;
+  try { r = await central.takeRecoveryReturn(); } catch (e) { return authView('login', { notice: 'That reset link could not be used: ' + e.message }); }
+  if (!r) return route();
+  if (r.error) return authView('login', { notice: r.error });
+  app.innerHTML = `<div class="auth"><div class="card auth-card stack"><div class="auth-logo" aria-hidden="true">🔑</div><h1>Choose a new password</h1>
+    <p class="muted" style="margin:0">Enter your recovery key and a new password for <strong>${esc(r.email)}</strong>.</p>
+    <form id="af" class="stack"><div><label for="rkey">Recovery key</label><input id="rkey" required autocomplete="off" spellcheck="false" autocapitalize="characters" placeholder="XXXX-XXXX-XXXX-…"></div>
+    <div><label for="password">New password (min ${auth.MIN_PASSWORD} characters)</label><input id="password" type="password" required autocomplete="new-password"></div>
+    <div><label for="password2">Repeat new password</label><input id="password2" type="password" required autocomplete="new-password"></div>
+    <div id="authErr" class="banner danger" role="alert" hidden></div>
+    <button class="btn primary" id="go" data-label="Reset password" type="submit">Reset password</button></form></div></div>`;
+  $('#af').onsubmit = async (e) => {
+    e.preventDefault(); const er = $('#authErr'); er.hidden = true;
+    if ($('#password').value !== $('#password2').value) { er.textContent = 'Passwords do not match.'; er.hidden = false; return; }
+    busyBtn($('#go'), true, 'Resetting…');
+    try {
+      const prof = await central.rpc('my_profile');
+      if (prof.status !== 'active' || !prof.blob) throw new Error('This account is not active, so it can’t be reset here.');
+      auth.importAccount(prof.blob); // make sure this device has the clinic's current key file
+      const out = await auth.resetWithRecovery(r.email, $('#rkey').value, $('#password').value, {
+        commit: async ({ account, authSecret }) => { await central.updatePassword(authSecret); await central.rpc('update_account_blob', { blob: account }); },
+      });
+      central.clear();
+      await showRecoveryKey(out.recoveryKey, r.email, () => authView('login', { notice: 'Password reset — sign in with your new password.' }), 'Password reset. Your old recovery key no longer works — save this new one.');
+    } catch (x) { er.textContent = x.message; er.hidden = false; busyBtn($('#go'), false); }
+  };
+}
+
+// ---------- clinic mode: who is signed in, and are they still allowed? ----------
+function applyProfile() {
+  const a = document.getElementById('navAdmin');
+  if (!a) return;
+  const admin = !!session && session.profile?.role === 'admin';
+  a.hidden = !admin;
+  const dot = document.getElementById('navDot');
+  const n = admin ? session.profile.pending_count || 0 : 0;
+  dot.hidden = !n; dot.textContent = n;
+}
+async function checkAccess() {
+  if (!session || !CLINIC_ON) return;
+  try {
+    const p = await central.rpc('my_profile');
+    if (p.status !== 'active') return lockApp(p.status === 'disabled' ? 'Your access to the clinic was disabled by an administrator.' : 'Your clinic account is not active.');
+    session.profile = p; applyProfile();
+    if (sync.kind !== 'clinic') await sync.startCentral(session.user, syncHooks); // we were offline at sign-in; start syncing now
+  } catch (e) { if (e.code === 'disabled' || e.code === 'not_active') lockApp('Your access to the clinic was disabled by an administrator.'); /* offline etc.: try again later */ }
+}
+
+// ---------- clinic directory (administrators) ----------
+async function adminView() {
+  if (!CLINIC_ON || session?.profile?.role !== 'admin') return notFound();
+  app.innerHTML = '<p class="muted pad"><span class="spinner"></span> Loading the clinic directory…</p>';
+  const [dir, audit] = await Promise.all([central.rpc('admin_directory'), central.rpc('admin_audit')]);
+  const count = (st) => dir.filter((d) => d.status === st).length;
+  const size = (b) => (b > 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB');
+  const STATUS = { pending: ['warn', 'Pending approval'], active: ['ok', 'Active'], disabled: ['danger', 'Disabled'] };
+  const meId = session.profile.id;
+  const row = (d) => {
+    const me = d.id === meId;
+    const btn = (act, label, cls = '') => `<button class="btn sm ${cls}" data-act="${act}" data-id="${d.id}">${label}</button>`;
+    const actions = me ? '<span class="muted small">This is you</span>' : d.status === 'pending' ? btn('approve', 'Approve', 'primary') + btn('remove', 'Decline', 'danger')
+      : d.status === 'active' ? btn('disable', 'Disable', 'danger') + btn('role', d.role === 'admin' ? 'Make clinician' : 'Make admin')
+      : btn('enable', 'Re-enable') + btn('remove', 'Remove permanently', 'danger');
+    return `<li class="card dir-item ${d.status}">
+      <span class="avatar" style="--h:${hue(d.email)}" aria-hidden="true">${esc((d.name || d.email)[0].toUpperCase())}</span>
+      <div class="grow"><div class="pname">${esc(d.name)} ${d.role === 'admin' ? '<span class="badge">Admin</span>' : ''} <span class="badge ${STATUS[d.status][0]}">${STATUS[d.status][1]}</span></div>
+        <div class="muted small">${esc(d.email)}</div>
+        <div class="muted small">Joined ${fmtDate(d.created_at)} · ${d.last_seen ? 'last active ' + fmtDateTime(d.last_seen) : 'never signed in'} · cloud data ${d.records} record${d.records === 1 ? '' : 's'} (${size(d.bytes)})</div></div>
+      <div class="row dir-actions">${actions}</div></li>`;
+  };
+  const label = (l) => {
+    const d = l.detail || {};
+    return ({ register: `${d.email} signed up (${d.status})`, approve: `${d.actor_email} approved ${d.target_email}`, disable: `${d.actor_email} disabled ${d.target_email}`, enable: `${d.actor_email} re-enabled ${d.target_email}`,
+      set_role: `${d.actor_email} made ${d.target_email} ${d.role === 'admin' ? 'an admin' : 'a clinician'}`, remove: `${d.actor_email} removed ${d.target_email}`, delete_self: `${d.email} deleted their own account`, account_key_update: `${d.email} changed their password or recovery key` })[l.action] || l.action;
+  };
+  app.innerHTML = `
+    <section class="hero"><div class="row between"><div><h1>Clinic directory</h1><p>${esc(central.clinicName())}</p></div></div>
+      <div class="stats"><div class="stat"><b>${count('active')}</b><span>Active</span></div><div class="stat"><b>${count('pending')}</b><span>Waiting for approval</span></div><div class="stat"><b>${count('disabled')}</b><span>Disabled</span></div></div></section>
+    <div class="setup" style="background:var(--brand-l);border-color:transparent"><strong>What administrators can and can’t see.</strong>
+      <div class="small">You see names, emails, status and how much encrypted storage each person uses. You <strong>can’t</strong> read anyone’s patients or notes — those are encrypted with each clinician’s own password. Disabling someone blocks their sign-in and cloud access immediately; copies already on their own devices stay on those devices.</div></div>
+    <ul class="plist">${dir.map(row).join('')}</ul>
+    <details class="card" style="margin-top:1rem"><summary>Activity log (last ${audit.length})</summary>
+      <ul style="margin:.6rem 0 0;padding-left:1.1rem">${audit.map((l) => `<li class="small"><span class="muted">${fmtDateTime(l.at)}</span> — ${esc(label(l))}</li>`).join('') || '<li class="muted small">Nothing yet.</li>'}</ul></details>`;
+  const verbs = { approve: ['admin_set_status', { status: 'active' }, 'Approved'], enable: ['admin_set_status', { status: 'active' }, 'Re-enabled'], disable: ['admin_set_status', { status: 'disabled' }, 'Disabled'], remove: ['admin_remove_user', {}, 'Removed'] };
+  $$('[data-act]').forEach((b) => (b.onclick = async () => {
+    const d = dir.find((x) => x.id === b.dataset.id), act = b.dataset.act;
+    const ask = { disable: `Disable ${d.name}? They are signed out and blocked from the clinic immediately.`, remove: `Permanently remove ${d.name} (${d.email}) and delete their encrypted cloud data? This cannot be undone.`, role: `Make ${d.name} ${d.role === 'admin' ? 'a clinician (no admin access)' : 'an administrator'}?` }[act];
+    if (ask && !confirm(ask)) return;
+    b.disabled = true;
+    try {
+      if (act === 'role') await central.rpc('admin_set_role', { user: d.id, role: d.role === 'admin' ? 'clinician' : 'admin' });
+      else { const [fn, args, done] = verbs[act]; await central.rpc(fn, { user: d.id, ...args }); toast(`${done}: ${d.name}`); }
+      await checkAccess(); await adminView();
+    } catch (e) { toast(e.message, true); b.disabled = false; }
+  }));
 }
 
 function deviceConnectView() {
@@ -1040,22 +1244,27 @@ Keep this private. Anyone with it and your username can reset your password.
 // ---------- auto-lock ----------
 let lastActive = Date.now();
 let idleTimer = null;
+let accessTimer = null;
 const bump = () => { lastActive = Date.now(); };
 const ACTIVITY = ['pointerdown', 'keydown', 'touchstart', 'scroll', 'input'];
 function idleCheck() {
   if (!session || recordingActive) return;
   if (Date.now() - lastActive > (getSettings().lockMinutes || 10) * 60000) lockApp('Locked after inactivity.');
 }
+const onVisAccess = () => { if (!document.hidden) checkAccess(); };
 function startIdle() {
   lastActive = Date.now();
   ACTIVITY.forEach((ev) => window.addEventListener(ev, bump, { passive: true, capture: true }));
   idleTimer = setInterval(idleCheck, 10000);
   document.addEventListener('visibilitychange', idleCheck);
+  if (CLINIC_ON) { accessTimer = setInterval(checkAccess, 60000); document.addEventListener('visibilitychange', onVisAccess); window.addEventListener('online', checkAccess); }
 }
 function stopIdle() {
   ACTIVITY.forEach((ev) => window.removeEventListener(ev, bump, { capture: true }));
-  clearInterval(idleTimer);
+  clearInterval(idleTimer); clearInterval(accessTimer);
   document.removeEventListener('visibilitychange', idleCheck);
+  document.removeEventListener('visibilitychange', onVisAccess);
+  window.removeEventListener('online', checkAccess);
 }
 
 // ---------- boot ----------
@@ -1064,4 +1273,5 @@ navigator.storage?.persist?.().catch(() => {});
 renderUserbox();
 const dbxReturn = takeAuthReturn(); // coming back from Dropbox's sign-in page?
 if (dbxReturn) handleDropboxReturn(dbxReturn);
+else if (CLINIC_ON && /^#(access_token|error)=/.test(location.hash)) handleRecoveryReturn(); // came back from a password-reset email
 else route(); // not signed in yet -> shows the sign-in / set-up screen

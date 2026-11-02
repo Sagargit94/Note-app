@@ -104,3 +104,43 @@ test('wire format round-trips ciphertext rows', async () => {
   const row = C.wireToRow(JSON.parse(JSON.stringify(C.rowToWire({ id: '1', ...box }))));
   assert.deepEqual(await C.decryptJson(s.key, row, 'visits:1'), { a: 1 });
 });
+
+test('deriveKeys: KEK matches the legacy derivation (existing accounts keep working) and gives a separate login secret', async () => {
+  const salt = C.randomBytes(16);
+  const dek = await C.newDataKey();
+  const wrapped = await C.wrapDek(dek, await C.passwordKek('legacy password!!', salt));          // made by an older version
+  const { kek, authSecret } = await C.deriveKeys('legacy password!!', salt);
+  const key = await C.unwrapDek(wrapped, kek);                                                    // opened by the new derivation
+  const box = await C.encryptJson(key, { ok: 1 }, 'x:1');
+  assert.deepEqual(await C.decryptJson(await C.unwrapDek(wrapped, await C.passwordKek('legacy password!!', salt)), box, 'x:1'), { ok: 1 });
+  assert.match(authSecret, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal((await C.deriveKeys('legacy password!!', salt)).authSecret, authSecret);          // deterministic
+  assert.notEqual((await C.deriveKeys('legacy password!?', salt)).authSecret, authSecret);
+  assert.notEqual((await C.deriveKeys('legacy password!!', C.randomBytes(16))).authSecret, authSecret);
+});
+
+test('clinic accounts use an email as username; sign-up/login/new-device all yield the same login secret', async () => {
+  const s = await Auth.signUp({ username: 'Dana@Clinic.test', displayName: 'Dana', password: PW, central: true });
+  assert.equal(s.user.username, 'dana@clinic.test'); assert.equal(s.user.central, true);
+  assert.equal((await Auth.logIn('DANA@clinic.test', PW)).authSecret, s.authSecret);
+  const blob = Auth.publicAccount('dana@clinic.test');
+  assert.equal(await Auth.deriveAuthSecret(PW, blob.kdf), s.authSecret);                         // what a brand-new device computes
+  await assert.rejects(Auth.signUp({ username: 'not an email', password: PW, central: true }), /valid email/);
+});
+
+test('commit hook: if the server update fails, the local password is NOT changed', async () => {
+  await Auth.signUp({ username: 'erin@clinic.test', password: PW, central: true });
+  await assert.rejects(Auth.changePassword('erin@clinic.test', PW, 'a different long password', { commit: async () => { throw new Error('server down'); } }), /server down/);
+  assert.ok(await Auth.logIn('erin@clinic.test', PW));                                            // old password still works
+  let seen;
+  const r = await Auth.changePassword('erin@clinic.test', PW, 'a different long password', { commit: async (x) => { seen = x; } });
+  assert.equal(seen.authSecret, r.authSecret); assert.ok(seen.account.pw.w);
+  assert.equal((await Auth.logIn('erin@clinic.test', 'a different long password')).authSecret, r.authSecret);
+  await assert.rejects(Auth.logIn('erin@clinic.test', PW));
+});
+
+test('forgetAccount removes a half-created account', async () => {
+  const s = await Auth.signUp({ username: 'fred@clinic.test', password: PW, central: true });
+  Auth.forgetAccount(s.user.id);
+  assert.equal(Auth.listAccounts().length, 0);
+});

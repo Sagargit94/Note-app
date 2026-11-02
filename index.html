@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0f766e">
   <meta name="color-scheme" content="light dark">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https://generativelanguage.googleapis.com https://api.dropboxapi.com https://content.dropboxapi.com http://localhost:* http://127.0.0.1:*; object-src 'none'; base-uri 'none'; form-action 'self'; manifest-src 'self'; worker-src 'self'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https://generativelanguage.googleapis.com https://api.dropboxapi.com https://content.dropboxapi.com https://*.supabase.co http://localhost:*  http://127.0.0.1:*; object-src 'none'; base-uri 'none'; form-action 'self'; manifest-src 'self'; worker-src 'self'">
   <meta name="referrer" content="no-referrer">
   <title>PhysioNotes</title>
   <link rel="manifest" href="manifest.webmanifest">
@@ -17,6 +17,7 @@
     <a class="brand" href="#/"><span class="logo" aria-hidden="true">✚</span> PhysioNotes</a>
     <nav>
       <a href="#/" data-nav="patients">Patients</a>
+      <a href="#/admin" data-nav="admin" id="navAdmin" hidden>Clinic <span class="navdot" id="navDot" hidden></span></a>
       <a href="#/settings" data-nav="settings">Settings</a>
     </nav>
     <div id="userbox" class="userbox"></div>

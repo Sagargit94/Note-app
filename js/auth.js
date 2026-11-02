@@ -11,6 +11,8 @@ export function listAccounts() {
 }
 function saveAccounts(a) { store().setItem(REG, JSON.stringify(a)); }
 const norm = (u) => String(u || '').trim().toLowerCase();
+// Solo mode: short handle. Clinic mode: the person's email address.
+export const validUsername = (u) => /^[a-z0-9._-]{3,32}$/.test(u) || (u.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(u));
 export const dbNameFor = (id) => 'physio-notes-u-' + id;
 
 export function validatePassword(pw) {
@@ -20,9 +22,9 @@ export function validatePassword(pw) {
 }
 
 // -> { user, key, recoveryKey }
-export async function signUp({ username, displayName, password }) {
+export async function signUp({ username, displayName, password, central = false }) {
   const u = norm(username);
-  if (!/^[a-z0-9._-]{3,32}$/.test(u)) throw new Error('Username: 3–32 letters, numbers, dot, dash or underscore.');
+  if (!validUsername(u)) throw new Error(central ? 'Enter a valid email address.' : 'Username: 3–32 letters, numbers, dot, dash or underscore.');
   const bad = validatePassword(password);
   if (bad) throw new Error(bad);
   const accounts = listAccounts();
@@ -31,34 +33,37 @@ export async function signUp({ username, displayName, password }) {
   const dek = await C.newDataKey();
   const salt = C.randomBytes(16), recSalt = C.randomBytes(16);
   const recoveryKey = C.newRecoveryKey();
+  const { kek, authSecret } = await C.deriveKeys(password, salt);
   const user = {
-    id: uid(), username: u, displayName: String(displayName || '').trim() || u, createdAt: new Date().toISOString(),
+    id: uid(), username: u, displayName: String(displayName || '').trim() || u, createdAt: new Date().toISOString(), central: !!central,
     kdf: { salt: C.b64e(salt), iter: C.PBKDF2_ITER },
-    pw: await C.wrapDek(dek, await C.passwordKek(password, salt)),
+    pw: await C.wrapDek(dek, kek),
     rec: { salt: C.b64e(recSalt), ...(await C.wrapDek(dek, await C.recoveryKek(recoveryKey, recSalt))) },
   };
   accounts.push(user);
   saveAccounts(accounts);
-  const key = await C.unwrapDek(user.pw, await C.passwordKek(password, salt)); // non-extractable session key
-  return { user: pub(user), key, recoveryKey };
+  const key = await C.unwrapDek(user.pw, kek); // non-extractable session key
+  return { user: pub(user), key, recoveryKey, authSecret };
 }
 
-const pub = (a) => ({ id: a.id, username: a.username, displayName: a.displayName });
+const pub = (a) => ({ id: a.id, username: a.username, displayName: a.displayName, central: !!a.central });
 
 export async function logIn(username, password) {
   const a = listAccounts().find((x) => x.username === norm(username));
   const fail = () => new Error('Incorrect username or password.');
   if (!a) { await C.passwordKek(password || 'x', C.randomBytes(16)); throw fail(); } // similar timing either way
   try {
-    const key = await C.unwrapDek(a.pw, await C.passwordKek(password, C.b64d(a.kdf.salt), a.kdf.iter));
-    return { user: pub(a), key };
+    const { kek, authSecret } = await C.deriveKeys(password, C.b64d(a.kdf.salt), a.kdf.iter);
+    return { user: pub(a), key: await C.unwrapDek(a.pw, kek), authSecret };
   } catch { throw fail(); }
 }
 
 async function setPassword(a, dek, newPassword) {
   const salt = C.randomBytes(16);
+  const { kek, authSecret } = await C.deriveKeys(newPassword, salt);
   a.kdf = { salt: C.b64e(salt), iter: C.PBKDF2_ITER };
-  a.pw = await C.wrapDek(dek, await C.passwordKek(newPassword, salt));
+  a.pw = await C.wrapDek(dek, kek);
+  return authSecret;
 }
 async function setRecovery(a, dek) {
   const recoveryKey = C.newRecoveryKey();
@@ -71,9 +76,16 @@ function find(accounts, username) {
   if (!a) throw new Error('Account not found.');
   return a;
 }
+// Persists a modified copy. `commit` (optional) runs first -- e.g. to update the clinic server -- and if it throws,
+// nothing is changed locally, so the two sides can't end up with different passwords.
+async function persist(accounts, original, modified, commit, extra) {
+  if (commit) await commit({ account: { ...modified }, ...extra });
+  accounts[accounts.indexOf(original)] = modified;
+  saveAccounts(accounts);
+}
 
 // Forgot password: prove possession of the recovery key, then set a new password AND a fresh recovery key.
-export async function resetWithRecovery(username, recoveryKey, newPassword) {
+export async function resetWithRecovery(username, recoveryKey, newPassword, { commit } = {}) {
   const bad = validatePassword(newPassword);
   if (bad) throw new Error(bad);
   const accounts = listAccounts();
@@ -81,40 +93,53 @@ export async function resetWithRecovery(username, recoveryKey, newPassword) {
   if (!a) throw new Error('Username or recovery key is not correct.');
   let dek;
   try { dek = await C.unwrapDek(a.rec, await C.recoveryKek(recoveryKey, C.b64d(a.rec.salt)), true); } catch { throw new Error('Username or recovery key is not correct.'); }
-  await setPassword(a, dek, newPassword);
-  const newRecovery = await setRecovery(a, dek);
-  saveAccounts(accounts);
-  return { recoveryKey: newRecovery };
+  const m = { ...a };
+  const authSecret = await setPassword(m, dek, newPassword);
+  const newRecovery = await setRecovery(m, dek);
+  await persist(accounts, a, m, commit, { authSecret });
+  return { recoveryKey: newRecovery, authSecret };
 }
 
-export async function changePassword(username, oldPassword, newPassword) {
+export async function changePassword(username, oldPassword, newPassword, { commit } = {}) {
   const bad = validatePassword(newPassword);
   if (bad) throw new Error(bad);
   const accounts = listAccounts();
   const a = find(accounts, username);
   let dek;
-  try { dek = await C.unwrapDek(a.pw, await C.passwordKek(oldPassword, C.b64d(a.kdf.salt), a.kdf.iter), true); } catch { throw new Error('Current password is incorrect.'); }
-  await setPassword(a, dek, newPassword);
-  saveAccounts(accounts);
+  try { dek = await C.unwrapDek(a.pw, (await C.deriveKeys(oldPassword, C.b64d(a.kdf.salt), a.kdf.iter)).kek, true); } catch { throw new Error('Current password is incorrect.'); }
+  const m = { ...a };
+  const authSecret = await setPassword(m, dek, newPassword);
+  await persist(accounts, a, m, commit, { authSecret });
+  return { authSecret };
 }
 
-export async function newRecoveryKey(username, password) {
+export async function newRecoveryKey(username, password, { commit } = {}) {
   const accounts = listAccounts();
   const a = find(accounts, username);
   let dek;
-  try { dek = await C.unwrapDek(a.pw, await C.passwordKek(password, C.b64d(a.kdf.salt), a.kdf.iter), true); } catch { throw new Error('Password is incorrect.'); }
-  const k = await setRecovery(a, dek);
-  saveAccounts(accounts);
+  try { dek = await C.unwrapDek(a.pw, (await C.deriveKeys(password, C.b64d(a.kdf.salt), a.kdf.iter)).kek, true); } catch { throw new Error('Password is incorrect.'); }
+  const m = { ...a };
+  const k = await setRecovery(m, dek);
+  await persist(accounts, a, m, commit, {});
   return k;
 }
 
 // Verifies the password, removes the account from the registry. Caller deletes the encrypted database.
-export async function removeAccount(username, password) {
+export async function removeAccount(username, password, { beforeRemove } = {}) {
   const accounts = listAccounts();
   const a = find(accounts, username);
-  try { await C.unwrapDek(a.pw, await C.passwordKek(password, C.b64d(a.kdf.salt), a.kdf.iter)); } catch { throw new Error('Password is incorrect.'); }
+  try { await C.unwrapDek(a.pw, (await C.deriveKeys(password, C.b64d(a.kdf.salt), a.kdf.iter)).kek); } catch { throw new Error('Password is incorrect.'); }
+  await beforeRemove?.(); // e.g. delete the clinic-side copy first; if that fails the local account is kept
   saveAccounts(accounts.filter((x) => x !== a));
   return a.id;
+}
+
+// Removes a half-created account (e.g. clinic sign-up failed) without needing the password.
+export function forgetAccount(id) { saveAccounts(listAccounts().filter((x) => x.id !== id)); }
+
+// The login secret for given hashing parameters (new-device sign-in, before the account exists locally).
+export async function deriveAuthSecret(password, kdf) {
+  return (await C.deriveKeys(password, C.b64d(kdf.salt), kdf.iter)).authSecret;
 }
 
 // The registry entry holds only public material (salts + wrapped keys), so it is what gets synced to new devices.
@@ -122,11 +147,11 @@ export function publicAccount(username) { return { ...find(listAccounts(), usern
 
 // Adds (or refreshes, e.g. after a password change on another device) an account fetched from the user's cloud folder.
 export function importAccount(blob) {
-  const ok = blob && typeof blob.id === 'string' && /^[a-z0-9._-]{3,32}$/.test(blob.username || '') && blob.kdf?.salt && blob.pw?.w && blob.rec?.w;
+  const ok = blob && typeof blob.id === 'string' && validUsername(blob.username || '') && blob.kdf?.salt && blob.pw?.w && blob.rec?.w;
   if (!ok) throw new Error('That account file is damaged.');
   const accounts = listAccounts();
   if (accounts.some((x) => x.username === blob.username && x.id !== blob.id)) throw new Error(`A different account called @${blob.username} already exists on this device.`);
-  const entry = { id: blob.id, username: blob.username, displayName: blob.displayName || blob.username, createdAt: blob.createdAt, kdf: blob.kdf, pw: blob.pw, rec: blob.rec };
+  const entry = { id: blob.id, username: blob.username, displayName: blob.displayName || blob.username, createdAt: blob.createdAt, central: !!blob.central, kdf: blob.kdf, pw: blob.pw, rec: blob.rec };
   const i = accounts.findIndex((x) => x.id === blob.id);
   if (i >= 0) accounts[i] = entry; else accounts.push(entry);
   saveAccounts(accounts);

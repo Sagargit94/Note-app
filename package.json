@@ -9,5 +9,8 @@
     "test": "node --test",
     "build": "node scripts/build-site.mjs"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "pg": "^8.23.1"
+  }
 }

@@ -17,6 +17,7 @@ A private, local-first notes app for physiotherapists. Installable as a PWA (pho
   | **Ollama** (local open-source model) | free | fully local |
 
   Gemini/Ollama also give: free-text questions about a patient, and *dictation → SOAP* structuring. AI output is decision support only.
+- **Clinic mode (optional)** – central sign-in by work email, administrator approval, a user directory (name, email, status) with disable/remove, and an activity log; sync through a free Supabase project. See *Clinic mode*.
 - **Multiple clinicians, private accounts** – each colleague creates their own login. Every account has its **own encrypted database**; patients, notes, recordings and the Gemini key are AES-256-GCM encrypted with a key unlocked only by that person's password. Auto-lock after inactivity, manual Lock / Sign out, recovery key, change password, delete account.
 - **Encrypted backup** – export/import everything (optionally with audio) as a passphrase-encrypted file; print a patient page.
 
@@ -33,7 +34,7 @@ PhysioNotes is a static website. It must be *served* (opening `index.html` by do
 
 Open that address on each device and use *Add to Home Screen* to install it.
 
-`npm test` runs the unit tests (analysis engine, accounts, encryption). Sync is covered by a two-device browser test against a mock Dropbox (`tests/e2e/`, needs Playwright).
+`npm test` runs the unit tests (analysis engine, accounts, encryption) and — when a Postgres is reachable via `PGHOST/PGPORT/PGUSER` — the 22 database security tests for `supabase/schema.sql`. Browser tests in `tests/e2e/` (need Playwright): two-device Dropbox sync against a mock Dropbox, and the full clinic flow (sign-up, approval, disable, isolation, password reset) against a Supabase stand-in running on real Postgres.
 
 ## Sync between your phone and laptop (Dropbox, end-to-end encrypted)
 
@@ -48,6 +49,28 @@ Everything is encrypted on your device *before* it is uploaded to a private app 
 **On your second device:** open the same web address → *Set up from Dropbox* → same App key → pick your account → sign in with your usual password. Your patients, notes and recordings download and decrypt locally.
 
 How it behaves: works fully offline and syncs in the background when online (header shows ☁ Synced / ⟳ Syncing / Offline). Signing out or auto-locking pushes your last edits first. If the **same visit is edited on two devices**, nothing is lost: the newer version stays and the other is kept as a **"Conflict copy"** for you to review. Deleting a patient/visit on one device removes it on the others. Voice recordings sync too (each recording up to ~13 MB).
+
+## Clinic mode: central sign-in, approvals and an admin directory (free Supabase)
+
+For a team: everyone signs in with their **work email**, new sign-ups must be **approved by an administrator**, the admin sees a **directory** (name, email, role, status, last active, storage used) and can **disable, re-enable, promote or remove** people. An activity log records every admin action. Encrypted notes sync between each person's devices through the clinic database (no Dropbox needed). Leave `js/config.js` empty to stay in solo mode.
+
+**What admins can and can't see.** Names, emails, status and storage use — never patients. Patient data is still end-to-end encrypted with each clinician's own password, in their browser; the database only holds ciphertext. The server never receives the real password either: it gets a separate login secret derived from it.
+
+**One-time setup (~10 min, done by the administrator; all free):**
+1. Create a free project at <https://supabase.com> (choose a region near you — e.g. *Canada (Central)* for Canadian clinics).
+2. *SQL Editor → New query*: paste all of [`supabase/schema.sql`](supabase/schema.sql), **replace `EDIT-ME@example.com` with the administrator's email** (the one marked line), and *Run*. It is safe to run again later.
+3. *Authentication → Sign In / Providers → Email*: switch **off** "Confirm email" (otherwise every colleague needs an email code; Supabase's built-in mailer only sends a few emails per hour). Leave "Enable sign ups" on — newcomers can't do anything until you approve them.
+4. *Authentication → URL Configuration*: set **Site URL** to your app's web address and add it under **Redirect URLs** (needed for password-reset links).
+5. *Project Settings → API*: copy the **Project URL** and the **anon public** key (never the `service_role`/secret key — the build refuses it).
+6. Build and publish: `npm run build -- --url https://xxxx.supabase.co --key <anon key> --name "My Clinic"`, then upload the `site` folder to your HTTPS host (see *Run it*). Or edit `js/config.js` directly.
+7. **Sign up first, with the administrator email** — you become admin automatically. Then share the link: colleagues sign up, see "Waiting for approval", and appear in *Clinic* for you to approve.
+
+**Good to know**
+- *Disabling someone* blocks their sign-in and all cloud access immediately, and their open app locks within about a minute. Copies already on their own devices stay on those devices (the clinic can't reach into them).
+- *No admin recovery of patient notes.* Because only each clinician's password/recovery key can decrypt their data, **if someone leaves, the clinic cannot read their patients' notes** — ask them to export an encrypted backup (Settings) first. A deliberate "clinic recovery key" escrow could be added if your policies need it; it's a decision about who may read patient records, so it's off by default.
+- *Lost password* → emailed reset link **plus** the recovery key saved at sign-up. Lose both and that person's data is unrecoverable by design.
+- *Free-tier limits:* 500 MB database (voice recordings count toward it), the project pauses after ~1 week of no activity (one click to resume; nothing is lost), and no automatic backups — keep encrypted exports.
+- *Register the administrator account before sharing the link:* anyone who signs up with the admin email first would become admin.
 
 ## Accounts & security model
 
@@ -73,6 +96,8 @@ js/ai.js        providers (offline, Gemini, Ollama), de-identification, prompts
 js/voice.js     recorder + live speech recognition + WAV conversion
 js/crypto.js    Web Crypto helpers (key wrap, AES-GCM, recovery key, backups)
 js/auth.js      accounts: sign-up, login, recovery, password change
+js/central.js   clinic backend client (Supabase auth + checked functions)   js/config.js  clinic settings
+supabase/schema.sql  clinic database: tables locked down, access only via checked functions
 js/dropbox.js   Dropbox OAuth (PKCE) + file API     js/sync.js  encrypted sync engine & conflict handling
 js/db.js        per-user encrypted IndexedDB     js/charts.js  SVG charts     js/app.js  UI/router
 ```

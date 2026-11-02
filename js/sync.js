@@ -6,6 +6,7 @@
 import * as db from './db.js';
 import * as C from './crypto.js';
 import { Dropbox, DbxError } from './dropbox.js';
+import { CentralStore } from './central.js';
 import { uid } from './util.js';
 
 const DIR = { patients: 'p', visits: 'v', audio: 'a', settings: 's' };
@@ -19,6 +20,7 @@ let again = false;
 let timer = null;
 let interval = null;
 export const state = { status: 'off', last: null, msg: '' };
+export let kind = 'off'; // 'dropbox' | 'clinic' | 'off'
 export const isEnabled = () => !!ctx;
 
 function setStatus(status, msg = '') {
@@ -39,8 +41,20 @@ export async function start(user, hooks = {}) {
   return true;
 }
 
-function attach(acct, tokens, { onStatus, onRemote } = {}) {
-  const dbx = new Dropbox(tokens, (t) => db.put('settings', { id: 'dropbox-device', tokens: t }).catch(() => {}));
+function attach(acct, tokens, hooks = {}) {
+  attachProvider(acct, new Dropbox(tokens, (t) => db.put('settings', { id: 'dropbox-device', tokens: t }).catch(() => {})), hooks);
+  kind = 'dropbox';
+}
+
+// Clinic mode: the clinic database is the sync target (no Dropbox needed).
+export async function startCentral(user, hooks = {}) {
+  attachProvider(user.id, new CentralStore(user.id), hooks);
+  kind = 'clinic';
+  await db.seedDirty(); // idempotent: only records that have no sync bookkeeping yet
+  schedule(300);
+}
+
+function attachProvider(acct, dbx, { onStatus, onRemote } = {}) {
   ctx = { acct: String(acct), dbx, onStatus, onRemote };
   db.setTracking(true, () => schedule());
   window.addEventListener('online', onNet);
@@ -60,7 +74,7 @@ export async function stop() {
   if (!running && navigator.onLine) syncNow();
   if (running) await Promise.race([running, new Promise((r) => setTimeout(r, 8000))]);
   db.setTracking(false);
-  ctx = null; running = null;
+  ctx = null; running = null; kind = 'off';
   state.status = 'off';
 }
 
@@ -130,7 +144,7 @@ async function cycle() {
     if (changed.size) ctx.onRemote?.(changed);
   } catch (e) {
     if (ctx !== c) return;
-    console.error('sync', e);
+    if (e.code !== 'not_active' && e.code !== 'disabled') console.error('sync', e); // revoked access is an expected condition, not a bug
     if (e instanceof TypeError || !navigator.onLine) setStatus('offline');
     else setStatus('error', e.status === 401 || /invalid_grant|expired|revoked/.test(e.summary || '') ? 'Dropbox access was revoked or expired — reconnect in Settings.' : e.message);
   }

@@ -178,3 +178,10 @@ dialog.modal::backdrop { background: rgba(8,20,24,.55); backdrop-filter: blur(3p
 
 .syncchip { color: #fff !important; font-size: .8rem; opacity: .95; } .syncchip.bad { background: rgba(220,38,38,.5); }
 code { background: var(--soft); padding: .05rem .35rem; border-radius: 6px; font-size: .85em; word-break: break-all; }
+
+/* clinic directory */
+.navdot { display: inline-grid; place-items: center; min-width: 1.15rem; height: 1.15rem; padding: 0 .3rem; border-radius: 99px; background: #fff; color: var(--danger); font-size: .72rem; font-weight: 800; margin-left: .2rem; }
+.dir-item { display: flex; gap: .9rem; align-items: center; flex-wrap: wrap; padding: .9rem 1.1rem; }
+.dir-item.pending { border-color: var(--warn); } .dir-item.disabled { opacity: .85; }
+.dir-actions { margin-left: auto; justify-content: flex-end; }
+@media (max-width: 640px) { .dir-actions { width: 100%; margin-left: 0; } }
