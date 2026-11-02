@@ -640,6 +640,9 @@ async function settingsView() {
       <p class="muted small" style="margin-top:0">Signed in as <strong>${esc(session.user.displayName)}</strong> (@${esc(session.user.username)}). Your patients, notes, recordings and API key are encrypted with a key only your password (or recovery key) can unlock. Colleagues using this app can’t see them.</p>
       <div class="grid2"><div><label for="lockMin">Auto-lock after inactivity</label><select id="lockMin">${[5, 10, 15, 30].map((m) => `<option value="${m}" ${s.lockMinutes === m ? 'selected' : ''}>${m} minutes</option>`).join('')}</select></div></div>
       <div class="row" style="margin-top:.8rem"><button class="btn" id="chPw">Change password</button><button class="btn" id="newRec">New recovery key</button><button class="btn danger" id="delAcct">Delete my account</button></div>
+      <h3 style="margin:1.2rem 0 .4rem">Accounts on this device</h3>
+      <ul class="plist" style="gap:.4rem">${auth.listAccounts().map((a) => `<li class="row" style="gap:.6rem"><span class="uav" style="background:var(--brand-l)">${esc((a.displayName || a.username)[0].toUpperCase())}</span><span class="grow"><strong>${esc(a.displayName)}</strong> <span class="muted small">@${esc(a.username)} · created ${fmtDate(a.createdAt)}</span></span>${a.id === session.user.id ? '<span class="badge ok">You</span>' : ''}</li>`).join('')}</ul>
+      <p class="muted small" style="margin-bottom:0">This list is stored only on this device. PhysioNotes has no central server and doesn’t collect email addresses, so there is no master list of users — each person’s patients stay private to them.</p>
     </div>
 
     <div class="card"><h2>Backup &amp; data</h2>
