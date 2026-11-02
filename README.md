@@ -25,7 +25,7 @@ A private, local-first notes app for physiotherapists. Installable as a PWA (pho
 
 PhysioNotes is a static website. It must be *served* (opening `index.html` by double-click does not work because browsers block modules and the microphone on `file://`).
 
-**Quick local try-out (Windows):** unzip the folder and double-click **`start.bat`** — opens http://localhost:8080 (uses Node or Python if installed, otherwise built-in PowerShell). Mac/Linux: `start.command`, or `node serve.mjs`.
+**Quick local try-out (Windows):** unzip the folder and double-click **`start.bat`** — it starts a small local server (using Node or Python if you have them, otherwise Windows' built-in PowerShell), then opens http://localhost:8080. Keep its black window open while you use the app; it stays open and shows a message if something goes wrong. Locked-down work PCs can block this — if so, skip it and use the online route below (no install needed). Mac/Linux: `start.command`, or `node serve.mjs` / `python3 serve.py`.
 
 **For real use on your phone *and* laptop, put it online over HTTPS** (needed for the microphone and Dropbox sign-in on a phone). The app contains no patient data or secrets, so any free static host works:
 
