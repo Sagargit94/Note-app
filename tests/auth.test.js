@@ -144,3 +144,67 @@ test('forgetAccount removes a half-created account', async () => {
   Auth.forgetAccount(s.user.id);
   assert.equal(Auth.listAccounts().length, 0);
 });
+
+// ---- clinic recovery + local lock-out ----
+const R = await import('../js/recovery.js');
+
+test('clinic recovery: a sealed account can be opened ONLY with the clinic recovery key', async () => {
+  const kp = await C.generateClinicKeyPair();
+  assert.match(kp.kid, /^[0-9a-f]{16}$/); assert.equal(kp.publicJwk.d, undefined);
+  const s = await Auth.signUp({ username: 'gwen@clinic.test', displayName: 'Gwen', password: PW, central: true, escrow: { jwk: kp.publicJwk, kid: kp.kid } });
+  const blob = Auth.publicAccount('gwen@clinic.test');
+  assert.equal(blob.escrow.kid, kp.kid);
+  assert.ok(!JSON.stringify(blob).includes(PW));
+  // records exactly as the app's database seals them
+  const aad = (n, id) => `${n}:${id}`;
+  const pat = await C.encryptJson(s.key, { id: 'p1', firstName: 'Zed', lastName: 'Zimmer' }, aad('patients', 'p1'));
+  const vis = await C.encryptJson(s.key, { id: 'v1', patientId: 'p1', subjective: 'RECOVER-ME' }, aad('visits', 'v1'));
+  const meta = await C.encryptJson(s.key, { id: 'a1', visitId: 'v1', durationSec: 3 }, aad('audio', 'a1'));
+  const bl = await C.encryptBytes(s.key, new Uint8Array([1, 2, 3, 4]).buffer, aad('audio-blob', 'a1'));
+  const wire = (id, box, extra = {}) => JSON.stringify({ v: 1, row: C.rowToWire({ id, iv: box.iv, ct: box.ct, ...extra }) });
+  const items = [
+    { k: 'p', id: 'p1', body: wire('p1', pat) }, { k: 'v', id: 'v1', body: wire('v1', vis) },
+    { k: 'a', id: 'a1', body: wire('a1', meta, { bl, mime: 'audio/webm' }) },
+    { k: 's', id: 'main', body: wire('main', pat) },                      // settings are never recovered
+    { k: 'p', id: 'bad', body: '{"row":"garbage"}' },                     // corrupt record is skipped, not fatal
+  ];
+  const out = await R.openRecovered({ escrow: blob.escrow, privateJwk: kp.privateJwk, items });
+  assert.equal(out.patients[0].firstName, 'Zed'); assert.equal(out.visits[0].subjective, 'RECOVER-ME');
+  assert.equal(out.audio.length, 1); assert.deepEqual([...C.b64d(out.audio[0].data)], [1, 2, 3, 4]); assert.equal(out.audio[0].mime, 'audio/webm');
+  assert.equal(out.skipped, 1);
+  assert.equal(R.toBackup(out).app, 'physio-notes');
+  // a different clinic key cannot open it
+  const other = await C.generateClinicKeyPair();
+  await assert.rejects(R.openRecovered({ escrow: blob.escrow, privateJwk: other.privateJwk, items }));
+});
+
+test('addEscrow seals an existing account to a (new) clinic key; wrong password refused; server failure changes nothing', async () => {
+  const kp = await C.generateClinicKeyPair();
+  await Auth.signUp({ username: 'hugo@clinic.test', password: PW, central: true });                  // made before recovery existed
+  assert.equal(Auth.publicAccount('hugo@clinic.test').escrow, undefined);
+  await assert.rejects(Auth.addEscrow('hugo@clinic.test', 'wrong wrong wrong', { jwk: kp.publicJwk, kid: kp.kid }), /incorrect/);
+  await assert.rejects(Auth.addEscrow('hugo@clinic.test', PW, { jwk: kp.publicJwk, kid: kp.kid }, { commit: async () => { throw new Error('offline'); } }), /offline/);
+  assert.equal(Auth.publicAccount('hugo@clinic.test').escrow, undefined);
+  await Auth.addEscrow('hugo@clinic.test', PW, { jwk: kp.publicJwk, kid: kp.kid });
+  assert.equal(Auth.publicAccount('hugo@clinic.test').escrow.kid, kp.kid);
+  const kp2 = await C.generateClinicKeyPair();                                                           // key rotation: re-seal to the new key
+  await Auth.addEscrow('hugo@clinic.test', PW, { jwk: kp2.publicJwk, kid: kp2.kid });
+  assert.equal(Auth.publicAccount('hugo@clinic.test').escrow.kid, kp2.kid);
+  assert.ok(await Auth.logIn('hugo@clinic.test', PW));                                                   // unaffected for the user
+});
+
+test('disabled: revokeLocal makes local data unopenable even with the right password; re-importing the clinic file restores it', async () => {
+  const s = await Auth.signUp({ username: 'ivy@clinic.test', displayName: 'Ivy', password: PW, central: true });
+  const box = await C.encryptJson(s.key, { note: 'stays on the device' }, 'visits:7');
+  const serverCopy = JSON.parse(JSON.stringify(Auth.publicAccount('ivy@clinic.test')));               // what the clinic holds
+  Auth.revokeLocal(s.user.id);
+  assert.equal(Auth.isRevoked('ivy@clinic.test'), true);
+  const entry = Auth.listAccounts().find((x) => x.username === 'ivy@clinic.test');
+  assert.equal(entry.pw, undefined); assert.equal(entry.rec, undefined);                               // nothing left to unlock with
+  assert.ok(!JSON.stringify(Auth.listAccounts()).includes(serverCopy.pw.w));
+  await assert.rejects(Auth.logIn('ivy@clinic.test', PW), (e) => e.code === 'revoked' && /disabled/.test(e.message));
+  await assert.rejects(Auth.resetWithRecovery('ivy@clinic.test', s.recoveryKey, 'another long password'), /not correct/);   // recovery key can't bypass it locally either
+  Auth.importAccount(serverCopy);                                                                        // re-enabled: sign-in fetched the key file again
+  const back = await Auth.logIn('ivy@clinic.test', PW);
+  assert.deepEqual(await C.decryptJson(back.key, box, 'visits:7'), { note: 'stays on the device' });
+});

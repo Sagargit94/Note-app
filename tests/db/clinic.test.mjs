@@ -20,7 +20,9 @@ before(async () => {
 });
 after(async () => { await db?.end(); if (admin) { await admin.query(`drop database if exists ${DBNAME} with (force)`); await admin.end(); } });
 
-const blob = (extra = {}) => ({ id: randomUUID(), username: 'x', displayName: 'X', kdf: { salt: 'AAAAAAAAAAAAAAAAAAAAAA==', iter: 600000 }, pw: { iv: 'iv', w: 'w' }, rec: { salt: 's', iv: 'i', w: 'w' }, ...extra });
+const KID = '0123456789abcdef';
+const JWK = { kty: 'RSA', n: 'sXch', e: 'AQAB', alg: 'RSA-OAEP-256' };
+const blob = (extra = {}) => ({ id: randomUUID(), username: 'x', displayName: 'X', kdf: { salt: 'AAAAAAAAAAAAAAAAAAAAAA==', iter: 600000 }, pw: { iv: 'iv', w: 'w' }, rec: { salt: 's', iv: 'i', w: 'w' }, escrow: { kid: KID, ct: 'AAAA' }, ...extra });
 async function call(uid, fn, args = {}, role = 'authenticated') {
   await db.query('begin');
   try {
@@ -36,9 +38,26 @@ const expectErr = (p, re) => assert.rejects(p, (e) => re.test(e.message));
 const T = (name, fn) => test(name, async (t) => { if (skip) return t.skip(skip); await db.query('rollback').catch(() => {}); await fn(t); });
 
 let boss, ann, bob, cat;
-T('first sign-up with the configured admin email (any case) becomes active admin; everyone else is pending', async () => {
+T('until the admin sets up clinic recovery, only the admin can sign up (others get clinic_not_ready)', async () => {
   boss = await user('boss@clinic.test'); ann = await user('ann@clinic.test'); bob = await user('bob@clinic.test'); cat = await user('cat@clinic.test');
-  assert.deepEqual(await call(boss, 'register_account', { name: 'Dr Boss', blob: blob() }), { status: 'active', role: 'admin' });
+  assert.equal(await call(null, 'clinic_public_key', {}, 'anon'), null);
+  await expectErr(call(ann, 'register_account', { name: 'Ann', blob: blob() }), /clinic_not_ready/);
+  assert.deepEqual(await call(boss, 'register_account', { name: 'Dr Boss', blob: blob({ escrow: undefined }) }), { status: 'active', role: 'admin' });   // admin email, any case
+});
+T('set_clinic_key: admin only, public half only, validated, audited, readable by everyone', async () => {
+  await expectErr(call(ann, 'set_clinic_key', { jwk: JWK, kid: KID }), /not_active|not_admin/);
+  await expectErr(call(boss, 'set_clinic_key', { jwk: { ...JWK, d: 'PRIVATE' }, kid: KID }), /bad_request/);   // a private key must never be accepted
+  await expectErr(call(boss, 'set_clinic_key', { jwk: { kty: 'oct', k: 'x' }, kid: KID }), /bad_request/);
+  await expectErr(call(boss, 'set_clinic_key', { jwk: JWK, kid: 'NOT-HEX' }), /bad_request/);
+  await call(boss, 'set_clinic_key', { jwk: JWK, kid: KID });
+  const pub = await call(null, 'clinic_public_key', {}, 'anon');
+  assert.equal(pub.kid, KID); assert.equal(pub.jwk.kty, 'RSA'); assert.equal(pub.jwk.d, undefined);
+  assert.ok((await call(boss, 'admin_audit')).some((l) => l.action === 'set_clinic_key' && l.detail.kid === KID));
+});
+T('after setup everyone else signs up as pending, and must include recovery sealed to the current key', async () => {
+  await expectErr(call(ann, 'register_account', { name: 'Ann', blob: blob({ escrow: undefined }) }), /escrow_required/);
+  await expectErr(call(ann, 'register_account', { name: 'Ann', blob: blob({ escrow: { kid: 'ffffffffffffffff', ct: 'AAAA' } }) }), /escrow_required/);   // old/wrong key
+  await expectErr(call(ann, 'register_account', { name: 'Ann', blob: blob({ escrow: { kid: KID, ct: '' } }) }), /escrow_required/);
   assert.deepEqual(await call(ann, 'register_account', { name: 'Ann', blob: blob() }), { status: 'pending', role: 'clinician' });
   assert.deepEqual(await call(bob, 'register_account', { name: 'Bob', blob: blob() }), { status: 'pending', role: 'clinician' });
   await call(cat, 'register_account', { name: 'Cat', blob: blob() });
@@ -96,7 +115,7 @@ T('kdf_params: real accounts return their salt; unknown emails get a stable fake
 
 T('pending users are blocked from sync and admin features, and get no key blob', async () => {
   const me = await call(ann, 'my_profile');
-  assert.equal(me.status, 'pending'); assert.equal(me.blob, null); assert.equal(me.pending_count, null);
+  assert.equal(me.status, 'pending'); assert.equal(me.blob, null); assert.equal(me.pending_count, null); assert.equal(me.clinic_key, null);
   for (const fn of ['sync_changes', 'sync_get', 'sync_put', 'sync_delete', 'update_account_blob', 'admin_directory'])
     await expectErr(call(ann, fn, { k: 'p', id: 'a', body: 'x', blob: blob() }), /not_active/);
 });
@@ -112,7 +131,7 @@ T('only admins can use admin functions (clinicians get not_admin)', async () => 
 
 T('approval activates the account and releases the key blob; audit log records it', async () => {
   const me = await call(ann, 'my_profile');
-  assert.equal(me.status, 'active'); assert.ok(me.blob?.kdf?.salt); assert.equal(me.email, 'ann@clinic.test');
+  assert.equal(me.status, 'active'); assert.ok(me.blob?.kdf?.salt); assert.equal(me.email, 'ann@clinic.test'); assert.equal(me.clinic_key.kid, KID);
   const log = await call(boss, 'admin_audit');
   assert.ok(log.some((l) => l.action === 'approve' && l.detail.target_email === 'ann@clinic.test'));
 });
@@ -162,7 +181,8 @@ T('the admin directory shows names, emails, status and storage — not content',
   assert.equal(by['boss@clinic.test'].role, 'admin');
   assert.equal(by['cat@clinic.test'].status, 'pending');
   assert.ok(by['bob@clinic.test'].bytes > 0 && by['bob@clinic.test'].records === 1);
-  assert.deepEqual(Object.keys(by['bob@clinic.test']).sort(), ['approved_at', 'bytes', 'created_at', 'email', 'id', 'last_seen', 'name', 'records', 'role', 'status']);
+  assert.deepEqual(Object.keys(by['bob@clinic.test']).sort(), ['approved_at', 'bytes', 'created_at', 'email', 'id', 'last_seen', 'name', 'records', 'recoverable', 'role', 'status']);
+  assert.equal(by['bob@clinic.test'].recoverable, true);
   assert.equal(dir[0].status, 'pending');                                                    // pending people are listed first
 });
 
@@ -217,4 +237,49 @@ T('a clinician cannot escalate privileges through any function they can call', a
   await denied("update public.profiles set role='admin'");
   await call(ann, 'register_account', { name: 'Ann', role: 'admin', status: 'active', blob: blob() });
   assert.equal((await db.query("select role, status from profiles where id=$1", [ann])).rows[0].role, 'clinician');
+});
+
+T('recovery cannot be stripped or pointed at another key when changing your password', async () => {
+  await expectErr(call(ann, 'update_account_blob', { blob: blob({ escrow: undefined }) }), /escrow_required/);
+  await expectErr(call(ann, 'update_account_blob', { blob: blob({ escrow: { kid: 'ffffffffffffffff', ct: 'AAAA' } }) }), /escrow_required/);
+});
+
+// ---- clinic recovery of a departed (disabled) person's data ----
+T('recovery: only an admin, never yourself, and ONLY for disabled accounts', async () => {
+  await call(ann, 'sync_put', { k: 'p', id: 'rec-patient', body: '{"row":"sealed-ann"}', base: null });
+  await expectErr(call(ann, 'admin_user_records', { user: boss }), /not_admin/);
+  await expectErr(call(boss, 'admin_user_records', { user: boss }), /cannot_change_self/);
+  await expectErr(call(boss, 'admin_user_records', { user: ann }), /target_not_disabled/);          // active clinicians' data can't be pulled
+  await expectErr(call(boss, 'admin_user_records', { user: randomUUID() }), /not_found/);
+  assert.equal((await db.query("select count(*)::int n from audit_log where action='recover_data'")).rows[0].n, 0);   // refusals are not "recoveries"
+});
+T('recovery: returns the sealed account file + only that person\'s live records, and is audited once', async () => {
+  const dan = await user('dan@clinic.test'); await call(dan, 'register_account', { name: 'Dan', blob: blob() }); await call(boss, 'admin_set_status', { user: dan, status: 'active' });
+  await call(dan, 'sync_put', { k: 'p', id: 'dan-patient', body: '{"row":"sealed-dan"}', base: null });
+  await call(ann, 'sync_put', { k: 'v', id: 'gone', body: '{"row":"x"}', base: null }); await call(ann, 'sync_delete', { k: 'v', id: 'gone' });
+  await call(boss, 'admin_set_status', { user: ann, status: 'disabled' });
+  const r = await call(boss, 'admin_user_records', { user: ann });
+  assert.equal(r.account.escrow.kid, KID); assert.equal(r.more, false);
+  const ids = r.items.map((i) => i.id);
+  assert.ok(ids.includes('rec-patient')); assert.ok(!ids.includes('dan-patient')); assert.ok(!ids.includes('gone'));
+  assert.ok(r.items.every((i) => !/sealed-dan/.test(i.body)));
+  const log = (await call(boss, 'admin_audit')).filter((l) => l.action === 'recover_data');
+  assert.equal(log.length, 1); assert.equal(log[0].detail.target_email, 'ann@clinic.test');
+  await call(boss, 'admin_user_records', { user: ann, since: r.items.at(-1).seq });                  // later pages are not re-logged
+  assert.equal((await call(boss, 'admin_audit')).filter((l) => l.action === 'recover_data').length, 1);
+  await expectErr(call(ann, 'admin_user_records', { user: ann }), /not_active/);                       // the disabled person can't use it themselves
+});
+T('recovery pages large accounts so no single response is huge', async () => {
+  const big = 'x'.repeat(3_500_000);
+  for (let i = 0; i < 3; i++) await db.query("insert into records(user_id,kind,id,body,seq) select id,'a',$1,$2,nextval('record_seq') from profiles where email='ann@clinic.test'", ['big-' + i, big]);
+  const pages = []; let since = 0, more = true;
+  while (more) { const r = await call(boss, 'admin_user_records', { user: ann, since }); pages.push(r); since = r.items.at(-1)?.seq ?? since; more = r.more; }
+  assert.ok(pages.length >= 2, 'big accounts arrive in several pages');
+  for (const pg of pages) assert.ok(pg.items.length === 1 || pg.items.reduce((n, i) => n + i.body.length, 0) <= 6_000_000, 'each page stays under ~6 MB');
+  const all = pages.flatMap((pg) => pg.items.map((i) => i.id));
+  assert.ok(['big-0', 'big-1', 'big-2', 'rec-patient'].every((id) => all.includes(id)) && new Set(all).size === all.length, 'every record delivered exactly once');
+});
+T('removing a disabled person deletes their sealed data (so recover first)', async () => {
+  await call(boss, 'admin_remove_user', { user: ann });
+  await expectErr(call(boss, 'admin_user_records', { user: ann }), /not_found/);
 });

@@ -4,4 +4,5 @@
 // (or build with:  npm run build -- --url https://xxxx.supabase.co --key <anon key> --name "My Clinic").
 // The anon key is designed to be public: the database only exposes checked functions and encrypts patient data
 // in the browser, so it grants nothing by itself.
-export const CLINIC = { supabaseUrl: '', anonKey: '', clinicName: '' };
+// offlineDays: how long the app may be opened offline between successful clinic check-ins (default 7).
+export const CLINIC = { supabaseUrl: '', anonKey: '', clinicName: '', offlineDays: 7 };

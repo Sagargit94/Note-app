@@ -22,7 +22,7 @@ export function validatePassword(pw) {
 }
 
 // -> { user, key, recoveryKey }
-export async function signUp({ username, displayName, password, central = false }) {
+export async function signUp({ username, displayName, password, central = false, escrow = null }) {
   const u = norm(username);
   if (!validUsername(u)) throw new Error(central ? 'Enter a valid email address.' : 'Username: 3–32 letters, numbers, dot, dash or underscore.');
   const bad = validatePassword(password);
@@ -38,6 +38,7 @@ export async function signUp({ username, displayName, password, central = false 
     id: uid(), username: u, displayName: String(displayName || '').trim() || u, createdAt: new Date().toISOString(), central: !!central,
     kdf: { salt: C.b64e(salt), iter: C.PBKDF2_ITER },
     pw: await C.wrapDek(dek, kek),
+    ...(escrow ? { escrow: await C.wrapForClinic(dek, escrow.jwk, escrow.kid) } : {}), // clinic recovery seal (clinic mode)
     rec: { salt: C.b64e(recSalt), ...(await C.wrapDek(dek, await C.recoveryKek(recoveryKey, recSalt))) },
   };
   accounts.push(user);
@@ -52,6 +53,7 @@ export async function logIn(username, password) {
   const a = listAccounts().find((x) => x.username === norm(username));
   const fail = () => new Error('Incorrect username or password.');
   if (!a) { await C.passwordKek(password || 'x', C.randomBytes(16)); throw fail(); } // similar timing either way
+  if (a.revoked) { const e = new Error('Your access to the clinic has been disabled. Connect to the internet and sign in again once an administrator has re-enabled you.'); e.code = 'revoked'; throw e; }
   try {
     const { kek, authSecret } = await C.deriveKeys(password, C.b64d(a.kdf.salt), a.kdf.iter);
     return { user: pub(a), key: await C.unwrapDek(a.pw, kek), authSecret };
@@ -151,9 +153,38 @@ export function importAccount(blob) {
   if (!ok) throw new Error('That account file is damaged.');
   const accounts = listAccounts();
   if (accounts.some((x) => x.username === blob.username && x.id !== blob.id)) throw new Error(`A different account called @${blob.username} already exists on this device.`);
-  const entry = { id: blob.id, username: blob.username, displayName: blob.displayName || blob.username, createdAt: blob.createdAt, central: !!blob.central, kdf: blob.kdf, pw: blob.pw, rec: blob.rec };
+  const entry = { id: blob.id, username: blob.username, displayName: blob.displayName || blob.username, createdAt: blob.createdAt, central: !!blob.central, kdf: blob.kdf, pw: blob.pw, rec: blob.rec, ...(blob.escrow ? { escrow: blob.escrow } : {}) };
   const i = accounts.findIndex((x) => x.id === blob.id);
   if (i >= 0) accounts[i] = entry; else accounts.push(entry);
   saveAccounts(accounts);
   return pub(entry);
+}
+
+// ---- clinic: local lock-out and recovery sealing ----------------------------------------------------------------
+// When the clinic disables someone, this device forgets the wrapped keys that a password could unlock. The encrypted
+// data stays on the device but is unreadable until an administrator re-enables the account and the person signs in
+// online (which fetches the key file from the clinic again).
+export function revokeLocal(id) {
+  const accounts = listAccounts();
+  const i = accounts.findIndex((x) => x.id === id);
+  if (i < 0) return;
+  const { pw, rec, ...rest } = accounts[i]; // eslint-disable-line no-unused-vars
+  accounts[i] = { ...rest, revoked: true };
+  saveAccounts(accounts);
+}
+export const isRevoked = (username) => !!listAccounts().find((x) => x.username === norm(username))?.revoked;
+
+export async function verifyPassword(username, password) {
+  const a = find(listAccounts(), username);
+  try { await C.unwrapDek(a.pw, (await C.deriveKeys(password, C.b64d(a.kdf.salt), a.kdf.iter)).kek); } catch { throw new Error('Password is incorrect.'); }
+}
+
+// Seals (or re-seals, after the clinic key changed) this account's data key to the clinic recovery key.
+export async function addEscrow(username, password, { jwk, kid }, { commit } = {}) {
+  const accounts = listAccounts();
+  const a = find(accounts, username);
+  let dek;
+  try { dek = await C.unwrapDek(a.pw, (await C.deriveKeys(password, C.b64d(a.kdf.salt), a.kdf.iter)).kek, true); } catch { throw new Error('Password is incorrect.'); }
+  const m = { ...a, escrow: await C.wrapForClinic(dek, jwk, kid) };
+  await persist(accounts, a, m, commit, {});
 }

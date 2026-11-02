@@ -54,7 +54,9 @@ How it behaves: works fully offline and syncs in the background when online (hea
 
 For a team: everyone signs in with their **work email**, new sign-ups must be **approved by an administrator**, the admin sees a **directory** (name, email, role, status, last active, storage used) and can **disable, re-enable, promote or remove** people. An activity log records every admin action. Encrypted notes sync between each person's devices through the clinic database (no Dropbox needed). Leave `js/config.js` empty to stay in solo mode.
 
-**What admins can and can't see.** Names, emails, status and storage use — never patients. Patient data is still end-to-end encrypted with each clinician's own password, in their browser; the database only holds ciphertext. The server never receives the real password either: it gets a separate login secret derived from it.
+**What admins can and can't see.** Names, emails, status and storage use. They **can't** read an active colleague's patients or notes — those are encrypted with that person's own password, in their browser, and the database only holds ciphertext. The server never receives the real password either: it gets a separate login secret derived from it.
+
+**Clinic recovery (on by default).** So the clinic never loses patient records when someone leaves, the administrator creates a **clinic recovery key** the first time they sign in (it's mandatory, and colleagues can't sign up until it's done). Every account then stores a copy of its data key *sealed to that key* (RSA-OAEP, 3072-bit) — unreadable without the **recovery file + passphrase** that only the administrator holds; the private half never reaches the server. Sign-up says plainly that recovery exists and when it applies. Rules: it can only be used on accounts that have been **disabled** (not on active colleagues), only by an admin, and **every recovery is written to the activity log**. Recovered records can be downloaded as an encrypted backup for whoever takes over the patients, or imported into the admin's account.
 
 **One-time setup (~10 min, done by the administrator; all free):**
 1. Create a free project at <https://supabase.com> (choose a region near you — e.g. *Canada (Central)* for Canadian clinics).
@@ -63,14 +65,19 @@ For a team: everyone signs in with their **work email**, new sign-ups must be **
 4. *Authentication → URL Configuration*: set **Site URL** to your app's web address and add it under **Redirect URLs** (needed for password-reset links).
 5. *Project Settings → API*: copy the **Project URL** and the **anon public** key (never the `service_role`/secret key — the build refuses it).
 6. Build and publish: `npm run build -- --url https://xxxx.supabase.co --key <anon key> --name "My Clinic"`, then upload the `site` folder to your HTTPS host (see *Run it*). Or edit `js/config.js` directly.
-7. **Sign up first, with the administrator email** — you become admin automatically. Then share the link: colleagues sign up, see "Waiting for approval", and appear in *Clinic* for you to approve.
+7. **Sign up first, with the administrator email** — you become admin automatically and are taken straight to **clinic recovery setup**: choose a passphrase, download the recovery file, and store the file and passphrase **separately and safely** (if both are lost, recovery is impossible). Then share the link: colleagues sign up, see "Waiting for approval", and appear in *Clinic* for you to approve.
+
+**When someone leaves — disabling and recovering**
+- *Disable* in *Clinic*. Their sign-in and all cloud access stop immediately, and their open app locks within about a minute.
+- **Their data stays on their device but can't be opened.** As soon as a device learns the account is disabled, it deletes the keys that a password could unlock; the encrypted data remains but is unreadable. If you later re-enable them, signing in online restores access. Offline use is also limited to **7 days** between clinic check-ins (`--offline-days`), so staying offline can't be used to dodge a disable.
+- *Recover their records* (**Recover data…** on the disabled person): choose the recovery file, enter its passphrase, then download an encrypted backup or import into your account. Do this **before** *Remove permanently*, which deletes their cloud data.
+- Honest limits: a disabled person who copied their key file *before* being disabled, and who knows their password, could in principle decrypt their own local copy with custom tooling — the clinic can't reach into a device, so this protects against ordinary use, not a determined insider. Copies they exported themselves (backups) are theirs.
 
 **Good to know**
-- *Disabling someone* blocks their sign-in and all cloud access immediately, and their open app locks within about a minute. Copies already on their own devices stay on those devices (the clinic can't reach into them).
-- *No admin recovery of patient notes.* Because only each clinician's password/recovery key can decrypt their data, **if someone leaves, the clinic cannot read their patients' notes** — ask them to export an encrypted backup (Settings) first. A deliberate "clinic recovery key" escrow could be added if your policies need it; it's a decision about who may read patient records, so it's off by default.
-- *Lost password* → emailed reset link **plus** the recovery key saved at sign-up. Lose both and that person's data is unrecoverable by design.
+- *Lost password* → emailed reset link **plus** the personal recovery key saved at sign-up. Lose both and that person's data is only recoverable through clinic recovery (if their account is disabled).
 - *Free-tier limits:* 500 MB database (voice recordings count toward it), the project pauses after ~1 week of no activity (one click to resume; nothing is lost), and no automatic backups — keep encrypted exports.
 - *Register the administrator account before sharing the link:* anyone who signs up with the admin email first would become admin.
+- *Recovery trust model:* the server can't verify that a user's recovery seal is genuine (it can't decrypt it), so a malicious clinician could in theory submit a bad seal. Recovery protects against departure and accidents, not against a determined insider.
 
 ## Accounts & security model
 

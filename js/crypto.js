@@ -111,3 +111,26 @@ export function wireToRow(w) {
   if (w.mime) row.mime = w.mime;
   return row;
 }
+
+// --- clinic recovery key (RSA-OAEP) -------------------------------------------------------------------------------
+// The admin's browser creates the pair. The PUBLIC half goes to the clinic server; every account seals a copy of its data
+// key to it. The PRIVATE half only ever exists in the admin's passphrase-protected recovery file.
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+export async function clinicKeyId(pub) {
+  return hex(await subtle.digest('SHA-256', te.encode(JSON.stringify({ e: pub.e, kty: 'RSA', n: pub.n })))).slice(0, 16);
+}
+export async function generateClinicKeyPair() {
+  const kp = await subtle.generateKey({ name: 'RSA-OAEP', modulusLength: 3072, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, true, ['wrapKey', 'unwrapKey']);
+  const pub = await subtle.exportKey('jwk', kp.publicKey);
+  const publicJwk = { kty: 'RSA', n: pub.n, e: pub.e, alg: 'RSA-OAEP-256' };
+  return { publicJwk, privateJwk: await subtle.exportKey('jwk', kp.privateKey), kid: await clinicKeyId(publicJwk) };
+}
+const pubKey = (jwk) => subtle.importKey('jwk', { kty: 'RSA', n: jwk.n, e: jwk.e, alg: 'RSA-OAEP-256', ext: true }, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['wrapKey']);
+// dek must be extractable (only briefly available, at sign-up / re-sealing)
+export async function wrapForClinic(dek, publicJwk, kid) {
+  return { kid, ct: b64e(await subtle.wrapKey('raw', dek, await pubKey(publicJwk), { name: 'RSA-OAEP' })) };
+}
+export async function unwrapFromClinic(escrow, privateJwk) {
+  const k = await subtle.importKey('jwk', privateJwk, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['unwrapKey']);
+  return subtle.unwrapKey('raw', b64d(escrow.ct), k, { name: 'RSA-OAEP' }, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+}

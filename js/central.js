@@ -7,6 +7,7 @@ import { DbxError } from './dropbox.js';
 
 export const enabled = () => !!(CLINIC.supabaseUrl && CLINIC.anonKey);
 export const clinicName = () => CLINIC.clinicName || 'your clinic';
+export const offlineDays = () => Number(CLINIC.offlineDays) > 0 ? Number(CLINIC.offlineDays) : 7; // how long the app may be used offline between clinic check-ins
 const base = () => CLINIC.supabaseUrl.replace(/\/+$/, '');
 
 export class CentralError extends Error {
@@ -19,6 +20,9 @@ const FRIENDLY = {
   cannot_change_self: 'You can’t change your own access.',
   disable_first: 'Disable the person first, then remove them.',
   last_admin: 'You are the only administrator — make someone else an admin first.',
+  clinic_not_ready: 'Your clinic hasn’t finished setting up yet. Ask your administrator to complete the recovery-key setup, then try again.',
+  escrow_required: 'Your account is missing its clinic recovery seal. Please sign in again to finish.',
+  target_not_disabled: 'Recovery is only available for accounts that have been disabled. Disable the person first.',
   not_found: 'That person no longer exists.',
 };
 function toError(status, d) {
@@ -60,6 +64,8 @@ function store(d) {
 }
 
 // ---- sign-in -------------------------------------------------------------------------------------------------
+// The clinic's recovery PUBLIC key ({jwk, kid}) or null if the administrator hasn't set it up yet.
+export const clinicKey = () => http('/rest/v1/rpc/clinic_public_key', { body: { p: {} } });
 export const kdfParams = (email) => http('/rest/v1/rpc/kdf_params', { body: { p: { email } } });
 
 export async function signUp(email, loginSecret) {

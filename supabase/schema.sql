@@ -6,6 +6,9 @@
 -- Design:
 --  * Patient data is end-to-end encrypted IN THE BROWSER. This database only ever stores ciphertext,
 --    plus a small directory (name, email, role, status) so an administrator can approve and disable people.
+--  * CLINIC RECOVERY (on by default): the administrator creates a recovery key pair in the app. Every account stores a copy
+--    of its data key sealed to the clinic's PUBLIC key, so records of someone who has left can be recovered by whoever holds
+--    the private recovery file -- and only for accounts that have been disabled; each recovery is written to the audit log.
 --  * The tables have Row Level Security switched on with NO policies, so the public API can't touch them
 --    directly. The app talks only to the checked functions below (each one verifies who you are and that
 --    your account is "active"). Anonymous visitors can call exactly one function (kdf_params).
@@ -98,6 +101,12 @@ begin
   return p;
 end $$;
 
+-- The clinic recovery public key: {"jwk": {...}, "kid": "..."} or null until the admin has set it up.
+create or replace function private.escrow() returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select (select value::jsonb from private.config where key = 'escrow')
+$$;
+
 create or replace function private.valid_blob(b jsonb) returns boolean
 language sql immutable set search_path = '' as $$
   select b is not null and jsonb_typeof(b) = 'object' and length(b::text) < 6000
@@ -124,7 +133,7 @@ create or replace function public.register_account(p jsonb) returns jsonb
 language plpgsql security definer set search_path = '' as $$
 declare
   v_uid uuid := auth.uid(); v_email text; v_name text := left(trim(coalesce(p ->> 'name', '')), 100);
-  v_blob jsonb := p -> 'blob'; v_admin text; v_role text := 'clinician'; v_status text := 'pending'; v_prof public.profiles;
+  v_blob jsonb := p -> 'blob'; v_admin text; v_role text := 'clinician'; v_status text := 'pending'; v_prof public.profiles; v_esc jsonb := private.escrow();
 begin
   if v_uid is null then raise exception 'not_signed_in'; end if;
   select * into v_prof from public.profiles where id = v_uid;
@@ -133,6 +142,12 @@ begin
   if v_email is null or v_name = '' or not private.valid_blob(v_blob) then raise exception 'bad_request'; end if;
   select value into v_admin from private.config where key = 'admin_email';
   if v_email = v_admin and not exists (select 1 from public.profiles where role = 'admin') then v_role := 'admin'; v_status := 'active'; end if;
+  if v_esc is null then
+    -- recovery isn't set up yet: only the administrator may sign up (they create the recovery key on first sign-in)
+    if v_role <> 'admin' then raise exception 'clinic_not_ready'; end if;
+  elsif coalesce(v_blob #>> '{escrow,kid}', '') <> v_esc ->> 'kid' or coalesce(v_blob #>> '{escrow,ct}', '') = '' then
+    raise exception 'escrow_required';
+  end if;
   insert into public.profiles (id, email, display_name, role, status, approved_at)
     values (v_uid, v_email, v_name, v_role, v_status, case when v_status = 'active' then now() end);
   insert into public.accounts (user_id, blob) values (v_uid, v_blob);
@@ -144,18 +159,19 @@ end $$;
 -- Who am I, and am I allowed in? (The key blob is only released to active accounts.)
 create or replace function public.my_profile(p jsonb default '{}') returns jsonb
 language plpgsql security definer set search_path = '' as $$
-declare v_uid uuid := auth.uid(); v_p public.profiles; v_blob jsonb; v_pending int := null;
+declare v_uid uuid := auth.uid(); v_p public.profiles; v_blob jsonb; v_pending int := null; v_key jsonb := null;
 begin
   if v_uid is null then raise exception 'not_signed_in'; end if;
   select * into v_p from public.profiles where id = v_uid;
   if not found then return jsonb_build_object('status', 'unregistered'); end if;
   if v_p.status = 'active' then
     select blob into v_blob from public.accounts where user_id = v_uid;
+    v_key := private.escrow();
     if v_p.last_seen is null or v_p.last_seen < now() - interval '1 minute' then update public.profiles set last_seen = now() where id = v_uid; end if;
     if v_p.role = 'admin' then select count(*) into v_pending from public.profiles where status = 'pending'; end if;
   end if;
   return jsonb_build_object('id', v_p.id, 'email', v_p.email, 'name', v_p.display_name, 'role', v_p.role, 'status', v_p.status,
-                            'blob', v_blob, 'pending_count', v_pending);
+                            'blob', v_blob, 'pending_count', v_pending, 'clinic_key', v_key);
 end $$;
 
 create or replace function public.update_account_blob(p jsonb) returns jsonb
@@ -163,10 +179,17 @@ language plpgsql security definer set search_path = '' as $$
 declare v_p public.profiles := private.require_active();
 begin
   if not private.valid_blob(p -> 'blob') then raise exception 'bad_request'; end if;
+  if private.escrow() is not null and (coalesce(p #>> '{blob,escrow,kid}', '') <> private.escrow() ->> 'kid' or coalesce(p #>> '{blob,escrow,ct}', '') = '') then
+    raise exception 'escrow_required';                       -- recovery can't be removed or left pointing at an old key
+  end if;
   update public.accounts set blob = p -> 'blob', updated_at = now() where user_id = v_p.id;
   insert into public.audit_log (actor, action, target, detail) values (v_p.id, 'account_key_update', v_p.id, jsonb_build_object('email', v_p.email));
   return jsonb_build_object('ok', true);
 end $$;
+
+-- The clinic recovery PUBLIC key (safe to share; needed by people signing up so their key can be sealed to it).
+create or replace function public.clinic_public_key(p jsonb default '{}') returns jsonb
+language sql stable security definer set search_path = '' as $$ select coalesce(private.escrow(), 'null'::jsonb) $$;
 
 -- ---- encrypted record sync (every function is scoped to the caller's own rows) ----------------------------
 create or replace function public.sync_changes(p jsonb) returns jsonb
@@ -242,10 +265,12 @@ declare v_p public.profiles := private.require_admin(); v_out jsonb;
 begin
   select coalesce(jsonb_agg(jsonb_build_object('id', pr.id, 'email', pr.email, 'name', pr.display_name, 'role', pr.role, 'status', pr.status,
            'created_at', pr.created_at, 'approved_at', pr.approved_at, 'last_seen', pr.last_seen,
-           'records', coalesce(u.n, 0), 'bytes', coalesce(u.b, 0))
+           'records', coalesce(u.n, 0), 'bytes', coalesce(u.b, 0),
+           'recoverable', coalesce(a.blob #>> '{escrow,kid}' = private.escrow() ->> 'kid', false))
          order by (pr.status = 'pending') desc, (pr.status = 'disabled'), pr.created_at), '[]'::jsonb)
     into v_out
     from public.profiles pr
+    left join public.accounts a on a.user_id = pr.id
     left join (select user_id, count(*) filter (where not deleted) n, sum(coalesce(length(body), 0)) b from public.records group by user_id) u on u.user_id = pr.id;
   return v_out;
 end $$;
@@ -305,6 +330,45 @@ begin
   return v_out;
 end $$;
 
+-- Administrator sets (or replaces) the clinic recovery public key. The private half never reaches the server.
+create or replace function public.set_clinic_key(p jsonb) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare v_a public.profiles := private.require_admin(); v_jwk jsonb := p -> 'jwk'; v_kid text := p ->> 'kid'; v_old jsonb := private.escrow();
+begin
+  if v_jwk is null or jsonb_typeof(v_jwk) <> 'object' or v_jwk ->> 'kty' <> 'RSA' or v_jwk ->> 'n' is null or v_jwk ->> 'e' is null
+     or v_jwk ? 'd' or length(v_jwk::text) > 2000 or v_kid !~ '^[0-9a-f]{16}$' then raise exception 'bad_request'; end if;   -- ('d' = private part: refuse)
+  insert into private.config (key, value) values ('escrow', jsonb_build_object('jwk', v_jwk, 'kid', v_kid)::text)
+    on conflict (key) do update set value = excluded.value;
+  insert into public.audit_log (actor, action, target, detail)
+    values (v_a.id, 'set_clinic_key', v_a.id, jsonb_build_object('actor_email', v_a.email, 'kid', v_kid, 'replaced', v_old is not null));
+  return jsonb_build_object('ok', true);
+end $$;
+
+-- Recovery of a departed person's sealed data. Only for DISABLED accounts, only by an admin, and always logged.
+-- Returns the account key file (first page) plus encrypted records; the admin's browser decrypts them with the recovery file.
+create or replace function public.admin_user_records(p jsonb) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare v_a public.profiles := private.require_admin(); v_t public.profiles; v_since bigint := coalesce((p ->> 'since')::bigint, 0);
+        v_items jsonb; v_last bigint; v_more boolean; v_blob jsonb;
+begin
+  select * into v_t from public.profiles where id = (p ->> 'user')::uuid;
+  if not found then raise exception 'not_found'; end if;
+  if v_t.id = v_a.id then raise exception 'cannot_change_self'; end if;
+  if v_t.status <> 'disabled' then raise exception 'target_not_disabled'; end if;
+  if v_since = 0 then
+    insert into public.audit_log (actor, action, target, detail)
+      values (v_a.id, 'recover_data', v_t.id, jsonb_build_object('actor_email', v_a.email, 'target_email', v_t.email));
+    select blob into v_blob from public.accounts where user_id = v_t.id;
+  end if;
+  with c as (select kind, id, seq, body, sum(length(body)) over (order by seq) as run
+               from public.records where user_id = v_t.id and not deleted and seq > v_since order by seq limit 200),
+       f as (select * from c where run <= 6000000 or seq = (select min(seq) from c))
+  select coalesce(jsonb_agg(jsonb_build_object('k', kind, 'id', id, 'seq', seq, 'body', body) order by seq), '[]'::jsonb) into v_items from f;
+  v_last := coalesce((v_items -> -1 ->> 'seq')::bigint, v_since);
+  select exists (select 1 from public.records where user_id = v_t.id and not deleted and seq > v_last) into v_more;
+  return jsonb_build_object('account', v_blob, 'items', v_items, 'more', v_more);
+end $$;
+
 -- ---- permissions: nothing is callable by default; grant exactly what each caller type needs ---------------
 do $grants$
 declare f text;
@@ -312,10 +376,11 @@ begin
   foreach f in array array[
     'kdf_params(jsonb)', 'register_account(jsonb)', 'my_profile(jsonb)', 'update_account_blob(jsonb)', 'sync_changes(jsonb)', 'sync_get(jsonb)',
     'sync_put(jsonb)', 'sync_delete(jsonb)', 'delete_me(jsonb)', 'admin_directory(jsonb)', 'admin_set_status(jsonb)', 'admin_set_role(jsonb)',
-    'admin_remove_user(jsonb)', 'admin_audit(jsonb)'] loop
+    'admin_remove_user(jsonb)', 'admin_audit(jsonb)', 'set_clinic_key(jsonb)', 'admin_user_records(jsonb)', 'clinic_public_key(jsonb)'] loop
     execute format('revoke all on function public.%s from public, anon, authenticated', f);
     execute format('grant execute on function public.%s to authenticated', f);
   end loop;
   grant execute on function public.kdf_params(jsonb) to anon;
+  grant execute on function public.clinic_public_key(jsonb) to anon;
 end
 $grants$;
