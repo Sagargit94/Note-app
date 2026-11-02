@@ -11,9 +11,9 @@ let admin, db, skip = false;
 
 before(async () => {
   try {
-    admin = new pg.Client({ database: 'postgres' }); await admin.connect();
+    const a = new pg.Client({ database: 'postgres' }); await a.connect(); admin = a;
     await admin.query(`create database ${DBNAME}`);
-    db = new pg.Client({ database: DBNAME }); await db.connect();
+    const d = new pg.Client({ database: DBNAME }); await d.connect(); db = d;
     await db.query(readFileSync(new URL('./auth-stub.sql', import.meta.url), 'utf8'));
     await db.query(readFileSync(new URL('../../supabase/schema.sql', import.meta.url), 'utf8').replace("constant text := 'EDIT-ME@example.com'", "constant text := 'Boss@Clinic.test'"));
   } catch (e) { skip = e.message; console.log('SKIPPED (no Postgres):', e.message); }
