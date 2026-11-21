@@ -27,7 +27,7 @@ PhysioNotes is a static website. It must be *served* (opening `index.html` by do
 
 **Quick local try-out (Windows):** unzip the folder and double-click **`start.bat`** — it starts a small local server (using Node or Python if you have them, otherwise Windows' built-in PowerShell), then opens http://localhost:8080. Keep its black window open while you use the app; it stays open and shows a message if something goes wrong. Locked-down work PCs can block this — if so, skip it and use the online route below (no install needed). Mac/Linux: `start.command`, or `node serve.mjs` / `python3 serve.py`.
 
-**For real use on your phone *and* laptop, put it online over HTTPS** (needed for the microphone and Dropbox sign-in on a phone). The app contains no patient data or secrets, so any free static host works:
+**For real use on your phone *and* laptop, put it online over HTTPS** (simplest: GitHub Pages — repo *Settings → Pages → Deploy from a branch → this branch, `/ (root)`*; the site appears at `https://<your-username>.github.io/<repo>/`) (needed for the microphone and Dropbox sign-in on a phone). The app contains no patient data or secrets, so any free static host works:
 
 - **Netlify Drop (easiest):** drag the ready-made **`ready-to-upload`** folder onto Netlify (sign in first so the site is permanent: *Add new project → Deploy manually*). You get an `https://…netlify.app` address immediately. (Don't drag the whole repository: its `package.json` makes Netlify try to "build" it and fail.)
 - **Cloudflare Pages / GitHub Pages:** a Pages workflow is included (`.github/workflows/pages.yml`; repo *Settings → Pages → Source: GitHub Actions*, merge to `main`). GitHub Pages needs a public repo on free plans — fine, since the code holds no data.
