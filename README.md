@@ -29,7 +29,7 @@ PhysioNotes is a static website. It must be *served* (opening `index.html` by do
 
 **For real use on your phone *and* laptop, put it online over HTTPS** (needed for the microphone and Dropbox sign-in on a phone). The app contains no patient data or secrets, so any free static host works:
 
-- **Netlify Drop (easiest):** run `npm run build` (or just use the files in `site/`), then drag the **`site`** folder onto <https://app.netlify.com/drop>. You get an `https://…netlify.app` address immediately.
+- **Netlify Drop (easiest):** drag the ready-made **`ready-to-upload`** folder onto Netlify (sign in first so the site is permanent: *Add new project → Deploy manually*). You get an `https://…netlify.app` address immediately. (Don't drag the whole repository: its `package.json` makes Netlify try to "build" it and fail.)
 - **Cloudflare Pages / GitHub Pages:** a Pages workflow is included (`.github/workflows/pages.yml`; repo *Settings → Pages → Source: GitHub Actions*, merge to `main`). GitHub Pages needs a public repo on free plans — fine, since the code holds no data.
 
 Open that address on each device and use *Add to Home Screen* to install it.
@@ -64,7 +64,7 @@ For a team: everyone signs in with their **work email**, new sign-ups must be **
 3. *Authentication → Sign In / Providers → Email*: switch **off** "Confirm email" (otherwise every colleague needs an email code; Supabase's built-in mailer only sends a few emails per hour). Leave "Enable sign ups" on — newcomers can't do anything until you approve them.
 4. *Authentication → URL Configuration*: set **Site URL** to your app's web address and add it under **Redirect URLs** (needed for password-reset links).
 5. *Project Settings → API*: copy the **Project URL** and the **anon public** key (never the `service_role`/secret key — the build refuses it).
-6. Build and publish: `npm run build -- --url https://xxxx.supabase.co --key <anon key> --name "My Clinic"`, then upload the `site` folder to your HTTPS host (see *Run it*). Or edit `js/config.js` directly.
+6. Build and publish: `npm run build -- --url https://xxxx.supabase.co --key <anon key> --name "My Clinic"`, then upload the `ready-to-upload` folder to your HTTPS host (see *Run it*). Or, without installing anything, edit `ready-to-upload/js/config.js` in Notepad and upload that folder.
 7. **Sign up first, with the administrator email** — you become admin automatically and are taken straight to **clinic recovery setup**: choose a passphrase, download the recovery file, and store the file and passphrase **separately and safely** (if both are lost, recovery is impossible). Then share the link: colleagues sign up, see "Waiting for approval", and appear in *Clinic* for you to approve.
 
 **When someone leaves — disabling and recovering**
