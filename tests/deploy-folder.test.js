@@ -5,7 +5,7 @@ import { join } from 'node:path';
 
 // ready-to-upload/ is what people drag onto a static host. It must mirror the source and contain no package.json
 // (hosts would otherwise try to "build" it). Regenerate with:  npm run build
-const root = new URL('..', import.meta.url).pathname;
+const root = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 const out = join(root, 'ready-to-upload');
 const walk = (d, base = d) => readdirSync(d).flatMap((f) => (statSync(join(d, f)).isDirectory() ? walk(join(d, f), base) : [join(d, f).slice(base.length + 1)]));
 

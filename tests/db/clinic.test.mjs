@@ -4,13 +4,16 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import pg from 'pg';
+let pg = null;
+try { pg = (await import('pg')).default; } catch { /* optional dev tool: the suite is skipped without it */ }
 
+let skip = false;
 const DBNAME = 'clinic_test_' + Math.random().toString(36).slice(2, 8);
-let admin, db, skip = false;
+let admin, db;
 
 before(async () => {
   try {
+    if (!pg) throw new Error('the `pg` package is not installed (npm install)');
     const a = new pg.Client({ database: 'postgres' }); await a.connect(); admin = a;
     await admin.query(`create database ${DBNAME}`);
     const d = new pg.Client({ database: DBNAME }); await d.connect(); db = d;
