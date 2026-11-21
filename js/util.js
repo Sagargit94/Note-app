@@ -34,13 +34,16 @@ export const toLocalInput = (iso) => {
 export const fromLocalInput = (v) => (v ? new Date(v).toISOString() : new Date().toISOString());
 
 export function debounce(fn, ms) {
-  let t;
+  let t = null;
   const d = (...a) => {
     clearTimeout(t);
-    t = setTimeout(() => fn(...a), ms);
+    t = setTimeout(() => { t = null; fn(...a); }, ms);
   };
+  // Runs the pending call now. Does NOTHING if there is no pending change (so leaving a page never re-saves stale data).
   d.flush = () => {
+    if (t === null) return undefined;
     clearTimeout(t);
+    t = null;
     return fn();
   };
   return d;

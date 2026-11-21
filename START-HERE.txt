@@ -1,0 +1,14 @@
+PhysioNotes - quick start (no technical knowledge needed)
+
+TO USE ON YOUR PHONE AND LAPTOP
+1. Sign in (free) at https://app.netlify.com
+2. Click "Add new project" -> "Deploy manually".
+3. Drag the folder called  ready-to-upload  (it is inside this folder) onto the page.
+   (If "Deploy manually" shows a build error, use https://app.netlify.com/drop instead while signed in.)
+   Do NOT drag this whole folder - only "ready-to-upload".
+4. Netlify gives you a web address ending in .netlify.app. Open it on your phone and laptop.
+
+TO TRY IT ON THIS COMPUTER ONLY
+Double-click start.bat (keep the black window open while you use the app).
+
+More detail: see README.md
