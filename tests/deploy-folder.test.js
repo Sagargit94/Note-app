@@ -12,8 +12,9 @@ const walk = (d, base = d) => readdirSync(d).flatMap((f) => (statSync(join(d, f)
 test('ready-to-upload mirrors the app source (except js/config.js) and has no build files', () => {
   assert.ok(existsSync(join(out, 'index.html')), 'run `npm run build` to regenerate ready-to-upload/');
   assert.ok(!existsSync(join(out, 'package.json')));
+  assert.match(readFileSync(join(out, 'netlify.toml'), 'utf8'), /nothing to build/);
   for (const f of walk(out)) {
-    if (f === 'js/config.js') continue;
+    if (f === 'js/config.js' || f === 'netlify.toml') continue;
     assert.equal(readFileSync(join(out, f), 'utf8'), readFileSync(join(root, f), 'utf8'), `${f} is out of date — run npm run build`);
   }
   for (const f of [...walk(join(root, 'js'), root), ...walk(join(root, 'css'), root), 'index.html', 'sw.js', 'manifest.webmanifest']) {

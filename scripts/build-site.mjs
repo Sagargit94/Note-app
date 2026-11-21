@@ -17,6 +17,9 @@ rmSync(out, { recursive: true, force: true });
 mkdirSync(out);
 for (const f of ['index.html', 'sw.js', 'manifest.webmanifest', 'css', 'js', 'icons']) cpSync(join(root, f), join(out, f), { recursive: true });
 
+// Tell hosts there is nothing to build (some upload screens always run a build step; this makes it a harmless no-op).
+writeFileSync(join(out, 'netlify.toml'), '[build]\n  command = "echo static site - nothing to build"\n  publish = "."\n');
+
 if (url || key) {
   if (!/^https:\/\/[a-z0-9-]+\.supabase\.co$/.test(url)) { console.error('--url should look like https://abcdefgh.supabase.co (Supabase → Project Settings → API → Project URL)'); process.exit(1); }
   if (!/^[\w-]+\.[\w-]+\.[\w-]+$/.test(key) && !/^sb_publishable_/.test(key)) { console.error('--key should be the "anon public" (or publishable) key, NOT the service_role / secret key.'); process.exit(1); }
